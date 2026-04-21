@@ -1,0 +1,4 @@
+deploy_config.json
+deploy_history.log
+.last_deploy_time
+.bin/
