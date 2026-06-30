@@ -18,14 +18,14 @@
 # 常量定义
 # ==========================================================
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_FILE="$WORKSPACE_DIR/.last_deploy_time"
+STATE_FILE_PVE="$WORKSPACE_DIR/.last_deploy_pve"
+STATE_FILE_OPNS="$WORKSPACE_DIR/.last_deploy_opnsense"
+STATE_FILE_TRUE="$WORKSPACE_DIR/.last_deploy_truenas"
 LOG_FILE="$WORKSPACE_DIR/deploy_history.log"
 CONFIG_FILE="$WORKSPACE_DIR/deploy_config.json"
 
 EXIT_SUCCESS=0
 EXIT_RUNTIME_ERROR=1
-
-MONITOR_CERT=""
 
 # ==========================================================
 # 工具函数
@@ -90,8 +90,6 @@ load_config() {
         fi
         echo "$val"
     }
-
-    CFG_MONITOR_CERT=$(jq_val '.monitor_cert' '')
 
     CFG_PVE_HOST=$(jq_req '.pve.host')
     CFG_PVE_NODE=$(jq_val '.pve.node' 'pve')
@@ -178,6 +176,11 @@ if [ "${1:-}" == "setup-cron" ]; then
             dow="*"
         fi
 
+        # 在 acme.sh 执行时间基础上延后 1 小时，确保证书已续签完毕
+        if [[ "$hour" =~ ^[0-9]+$ ]]; then
+            hour=$(( (hour + 1) % 24 ))
+        fi
+
         DEPLOY_SCRIPT="$WORKSPACE_DIR/deploy_all.sh"
         NEW_CRON="$min $hour $dom $mon $dow $DEPLOY_SCRIPT"
 
@@ -188,7 +191,7 @@ if [ "${1:-}" == "setup-cron" ]; then
             (crontab -l 2>/dev/null; echo "$NEW_CRON") | crontab -
             log_success "自动部署定时任务设定成功"
             log_info "已加入定时任务: $NEW_CRON"
-            log_info "设定为与 acme.sh 完全相同的时间执行，仅在检测到新证书后才会实际部署"
+            log_info "设定为 acme.sh 执行后 1 小时运行，各平台独立检测证书更新后按需部署"
         fi
     fi
     exit $EXIT_SUCCESS
@@ -211,94 +214,141 @@ log_success "系统依赖检查通过 (curl, jq, sshpass, ssh, scp)"
 
 log_info "阶段 1: 加载集中配置"
 load_config
-MONITOR_CERT="$CFG_MONITOR_CERT"
 log_success "已加载配置文件: $CONFIG_FILE"
 
-log_info "阶段 2: 检查证书文件更新状态"
-if [ -z "$MONITOR_CERT" ]; then
-    log_warning "未配置 monitor_cert，跳过时间检查并继续执行部署"
-elif [ ! -f "$MONITOR_CERT" ]; then
-    log_warning "监控的证书文件不存在 ($MONITOR_CERT)，跳过时间检查并继续执行部署"
-else
-    CERT_MTIME=$(stat -c %Y "$MONITOR_CERT")
-    if [ -f "$STATE_FILE" ]; then
-        LAST_DEPLOY_TIME=$(cat "$STATE_FILE")
-    else
-        LAST_DEPLOY_TIME=0
+# 检查单个平台证书是否有更新
+# 用法: cert_updated <cert_file> <state_file> <platform_name>
+# 返回 0=需要部署，1=跳过
+cert_updated() {
+    local cert="$1" state_file="$2" platform="$3"
+    if [ -z "$cert" ]; then
+        log_warning "[$platform] 未配置证书路径，将强制执行部署"
+        return 0
     fi
-    
-    if [ "$CERT_MTIME" -le "$LAST_DEPLOY_TIME" ]; then
-        log_info "证书自上次部署($LAST_DEPLOY_TIME)以来没有更新($CERT_MTIME)，取消执行"
-        exit $EXIT_SUCCESS
-    else
-        log_success "检测到证书有新版本，开始执行部署逻辑"
+    if [ ! -f "$cert" ]; then
+        log_warning "[$platform] 证书文件不存在 ($cert)，将强制执行部署"
+        return 0
     fi
-fi
+    local cert_mtime last_deploy
+    cert_mtime=$(stat -c %Y "$cert")
+    if [ -f "$state_file" ]; then
+        last_deploy=$(cat "$state_file")
+    else
+        last_deploy=0
+    fi
+    if [ "$cert_mtime" -le "$last_deploy" ]; then
+        log_info "[$platform] 证书自上次部署($(date -d "@$last_deploy" '+%Y-%m-%d %H:%M:%S'))以来没有更新，跳过部署"
+        return 1
+    else
+        log_success "[$platform] 检测到证书有新版本，开始部署"
+        return 0
+    fi
+}
 
-log_info "阶段 3: 开始执行证书部署"
+log_info "阶段 2: 按平台独立检查证书并执行部署"
 
+# --- PVE ---
 log_info "[1/3] 部署到 Proxmox VE (PVE)"
-PVE_CMD=(
-    "$WORKSPACE_DIR/deploy_to_pve.sh"
-    -H "$CFG_PVE_HOST"
-    -n "$CFG_PVE_NODE"
-    --token-id "$CFG_PVE_TOKEN_ID"
-    --token-secret "$CFG_PVE_TOKEN_SECRET"
-    -c "$CFG_PVE_CERT"
-    -k "$CFG_PVE_KEY"
-)
-"${PVE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
-PVE_STATUS=${PIPESTATUS[0]}
-
-log_info "[2/3] 部署到 OPNsense"
-OPNS_CMD=(
-    "$WORKSPACE_DIR/deploy_to_opnsense.sh"
-    -H "$CFG_OPNS_HOST"
-    -p "$CFG_OPNS_PORT"
-    -u "$CFG_OPNS_USER"
-    -P "$CFG_OPNS_PASSWORD"
-    -c "$CFG_OPNS_CERT"
-    -k "$CFG_OPNS_KEY"
-    -d "$CFG_OPNS_REMOTE_DIR"
-    --api-key "$CFG_OPNS_API_KEY"
-    --api-secret "$CFG_OPNS_API_SECRET"
-    --api-port "$CFG_OPNS_API_PORT"
-    --prefix "$CFG_OPNS_PREFIX"
-    --keep "$CFG_OPNS_KEEP"
-)
-"${OPNS_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
-OPNS_STATUS=${PIPESTATUS[0]}
-
-log_info "[3/3] 部署到 TrueNAS"
-TRUE_CMD=(
-    "$WORKSPACE_DIR/deploy_to_truenas.sh"
-    -H "$CFG_TRUE_HOST"
-    -A "$CFG_TRUE_API_KEY"
-    -c "$CFG_TRUE_CERT"
-    -k "$CFG_TRUE_KEY"
-    --ws-path "$CFG_TRUE_WS_PATH"
-    --prefix "$CFG_TRUE_PREFIX"
-    --keep "$CFG_TRUE_KEEP"
-)
-if [ -n "$CFG_TRUE_NAME" ]; then
-    TRUE_CMD+=( -n "$CFG_TRUE_NAME" )
+PVE_STATUS=0
+PVE_SKIPPED=false
+if cert_updated "$CFG_PVE_CERT" "$STATE_FILE_PVE" "PVE"; then
+    PVE_CMD=(
+        "$WORKSPACE_DIR/deploy_to_pve.sh"
+        -H "$CFG_PVE_HOST"
+        -n "$CFG_PVE_NODE"
+        --token-id "$CFG_PVE_TOKEN_ID"
+        --token-secret "$CFG_PVE_TOKEN_SECRET"
+        -c "$CFG_PVE_CERT"
+        -k "$CFG_PVE_KEY"
+    )
+    "${PVE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
+    PVE_STATUS=${PIPESTATUS[0]}
+    if [ "$PVE_STATUS" -eq 0 ]; then
+        date +%s > "$STATE_FILE_PVE"
+    fi
+else
+    PVE_SKIPPED=true
 fi
-"${TRUE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
-TRUE_STATUS=${PIPESTATUS[0]}
+
+# --- OPNsense ---
+log_info "[2/3] 部署到 OPNsense"
+OPNS_STATUS=0
+OPNS_SKIPPED=false
+if cert_updated "$CFG_OPNS_CERT" "$STATE_FILE_OPNS" "OPNsense"; then
+    OPNS_CMD=(
+        "$WORKSPACE_DIR/deploy_to_opnsense.sh"
+        -H "$CFG_OPNS_HOST"
+        -p "$CFG_OPNS_PORT"
+        -u "$CFG_OPNS_USER"
+        -P "$CFG_OPNS_PASSWORD"
+        -c "$CFG_OPNS_CERT"
+        -k "$CFG_OPNS_KEY"
+        -d "$CFG_OPNS_REMOTE_DIR"
+        --api-key "$CFG_OPNS_API_KEY"
+        --api-secret "$CFG_OPNS_API_SECRET"
+        --api-port "$CFG_OPNS_API_PORT"
+        --prefix "$CFG_OPNS_PREFIX"
+        --keep "$CFG_OPNS_KEEP"
+    )
+    "${OPNS_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
+    OPNS_STATUS=${PIPESTATUS[0]}
+    if [ "$OPNS_STATUS" -eq 0 ]; then
+        date +%s > "$STATE_FILE_OPNS"
+    fi
+else
+    OPNS_SKIPPED=true
+fi
+
+# --- TrueNAS ---
+log_info "[3/3] 部署到 TrueNAS"
+TRUE_STATUS=0
+TRUE_SKIPPED=false
+if cert_updated "$CFG_TRUE_CERT" "$STATE_FILE_TRUE" "TrueNAS"; then
+    TRUE_CMD=(
+        "$WORKSPACE_DIR/deploy_to_truenas.sh"
+        -H "$CFG_TRUE_HOST"
+        -A "$CFG_TRUE_API_KEY"
+        -c "$CFG_TRUE_CERT"
+        -k "$CFG_TRUE_KEY"
+        --ws-path "$CFG_TRUE_WS_PATH"
+        --prefix "$CFG_TRUE_PREFIX"
+        --keep "$CFG_TRUE_KEEP"
+    )
+    if [ -n "$CFG_TRUE_NAME" ]; then
+        TRUE_CMD+=( -n "$CFG_TRUE_NAME" )
+    fi
+    "${TRUE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
+    TRUE_STATUS=${PIPESTATUS[0]}
+    if [ "$TRUE_STATUS" -eq 0 ]; then
+        date +%s > "$STATE_FILE_TRUE"
+    fi
+else
+    TRUE_SKIPPED=true
+fi
 
 log_info "部署结果总结"
-if [ "$PVE_STATUS" -eq 0 ];  then log_success "PVE: 成功";      else log_error "PVE: 失败"; fi
-if [ "$OPNS_STATUS" -eq 0 ]; then log_success "OPNsense: 成功";  else log_error "OPNsense: 失败"; fi
-if [ "$TRUE_STATUS" -eq 0 ]; then log_success "TrueNAS: 成功";   else log_error "TrueNAS: 失败"; fi
+if   $PVE_SKIPPED;              then log_info    "PVE:      已跳过 (证书未更新)"
+elif [ "$PVE_STATUS" -eq 0 ];   then log_success "PVE:      成功"
+else                                  log_error  "PVE:      失败"
+fi
+if   $OPNS_SKIPPED;             then log_info    "OPNsense: 已跳过 (证书未更新)"
+elif [ "$OPNS_STATUS" -eq 0 ];  then log_success "OPNsense: 成功"
+else                                  log_error  "OPNsense: 失败"
+fi
+if   $TRUE_SKIPPED;             then log_info    "TrueNAS:  已跳过 (证书未更新)"
+elif [ "$TRUE_STATUS" -eq 0 ];  then log_success "TrueNAS:  成功"
+else                                  log_error  "TrueNAS:  失败"
+fi
 
-if [ "$PVE_STATUS" -eq 0 ] && [ "$OPNS_STATUS" -eq 0 ] && [ "$TRUE_STATUS" -eq 0 ]; then
-    log_success "所有平台部署任务顺利完成"
-    if [ -f "$MONITOR_CERT" ]; then
-        date +%s > "$STATE_FILE"
-        log_info "已记录部署时间状态到 $STATE_FILE"
-    fi
-    exit $EXIT_SUCCESS
-else
+# 任何执行过的平台失败则整体失败
+if [ "$PVE_STATUS" -ne 0 ] || [ "$OPNS_STATUS" -ne 0 ] || [ "$TRUE_STATUS" -ne 0 ]; then
     log_error "部分或全部平台部署失败，请检查详细日志: $LOG_FILE"
     exit $EXIT_RUNTIME_ERROR
 fi
+
+if $PVE_SKIPPED && $OPNS_SKIPPED && $TRUE_SKIPPED; then
+    log_info "所有平台证书均无更新，无需部署"
+else
+    log_success "所有执行的平台部署任务顺利完成"
+fi
+exit $EXIT_SUCCESS

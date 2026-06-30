@@ -37,7 +37,7 @@
 ### 1. 修改集中配置文件 (非常重要)
 在使用工具前，请只修改脚本目录下的 deploy_config.json。deploy_all.sh 会统一读取这个文件，并把参数分别传给 PVE、OPNsense、TrueNAS 三个部署脚本。
 
-其中 monitor_cert 用于控制是否需要触发整套部署；如果留空，deploy_all.sh 会跳过证书更新时间检查并直接执行。
+各平台 (pve / opnsense / truenas) 的 `cert` 字段同时用于"推送内容"和"变更检测"：脚本会比较该证书文件的 mtime 与该平台上一次成功部署的时间戳，仅在证书真正续签后才触发对应平台的部署，三个平台彼此独立、互不影响。
 
 PVE 仅支持官方 API Token 认证。
 - token_id 的格式为 USER@REALM!TOKENID，例如 root@pam!deploycerts。
