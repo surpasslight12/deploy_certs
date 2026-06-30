@@ -26,6 +26,11 @@ POLL_INTERVAL=1
 AUTH_RETRIES=3
 RETRY_DELAY=2
 
+# 固定 websocat 版本：本地 .bin/websocat 与此版本不一致时会自动重新下载
+# 升级时只需修改此常量
+WEBSOCAT_VERSION="1.14.1"
+WEBSOCAT_RELEASE_BASE="https://github.com/vi/websocat/releases/download"
+
 EXIT_SUCCESS=0
 EXIT_RUNTIME_ERROR=1
 EXIT_CERT_NOT_FOUND=2
@@ -65,48 +70,96 @@ validate_readable_file() {
 # 特定功能函数: websocat 管理
 # ==========================================================
 
-# 查找或自动下载 websocat
-setup_websocat() {
-    if command -v websocat &>/dev/null; then
-        WEBSOCAT_BIN="websocat"
-        return 0
-    fi
+# 获取二进制的 websocat 版本号 (例如 "1.14.1")，无法识别时返回空
+get_websocat_version() {
+    local bin="$1"
+    local out
+    out=$("$bin" --version 2>/dev/null) || return 0
+    # 期望格式: "websocat 1.14.1"，取第二个字段并去掉可能的前导 v
+    echo "$out" | head -n1 | awk '{print $2}' | sed 's/^v//'
+}
 
-    local bin_dir="$WORKSPACE_DIR/.bin"
-    local bin_path="$bin_dir/websocat"
-    if [ -x "$bin_path" ]; then
-        WEBSOCAT_BIN="$bin_path"
-        return 0
-    fi
-
-    print_info "未找到 websocat，正在下载..."
+# 按当前架构解析对应的 websocat 下载 URL
+resolve_websocat_url() {
+    local version="$1"
     local arch
     arch=$(uname -m)
-    local download_url=""
     case "$arch" in
-        x86_64)  download_url="https://github.com/vi/websocat/releases/latest/download/websocat.x86_64-unknown-linux-musl" ;;
-        aarch64) download_url="https://github.com/vi/websocat/releases/latest/download/websocat.aarch64-unknown-linux-musl" ;;
+        x86_64)  echo "${WEBSOCAT_RELEASE_BASE}/v${version}/websocat.x86_64-unknown-linux-musl" ;;
+        aarch64) echo "${WEBSOCAT_RELEASE_BASE}/v${version}/websocat.aarch64-unknown-linux-musl" ;;
         *)
             print_error "不支持的架构: $arch，请手动安装 websocat"
             return 1
             ;;
     esac
+}
 
-    mkdir -p "$bin_dir"
-    if ! curl -sL -o "$bin_path" "$download_url"; then
-        print_error "从 $download_url 下载 websocat 失败"
+# 下载指定版本到 $1 (目标路径)，下载后校验可执行性与版本号
+download_websocat() {
+    local bin_path="$1" version="$2"
+    local url
+    url=$(resolve_websocat_url "$version") || return 1
+
+    mkdir -p "$(dirname "$bin_path")"
+    # -f 让 HTTP 错误不被当成成功；避免把 404 页面写入二进制
+    if ! curl -fsSL -o "$bin_path" "$url"; then
+        print_error "从 $url 下载 websocat 失败"
+        rm -f "$bin_path"
         return 1
     fi
     chmod +x "$bin_path"
 
-    if ! "$bin_path" --version &>/dev/null; then
+    local new_ver
+    new_ver=$(get_websocat_version "$bin_path")
+    if [ -z "$new_ver" ]; then
         print_error "下载的 websocat 二进制文件无法运行"
         rm -f "$bin_path"
         return 1
     fi
+    if [ "$new_ver" != "$version" ]; then
+        print_warning "下载的 websocat 报告版本 $new_ver，与预期 $version 不一致"
+    fi
+    print_info "websocat $new_ver 已安装到 $bin_path"
+}
 
+# 查找或自动下载 websocat，并对本地缓存做版本检查/更新
+setup_websocat() {
+    local target_ver="$WEBSOCAT_VERSION"
+    local bin_dir="$WORKSPACE_DIR/.bin"
+    local bin_path="$bin_dir/websocat"
+
+    # 1) 优先使用系统已安装的 websocat (不强制替换系统二进制)
+    if command -v websocat &>/dev/null; then
+        local sys_bin sys_ver
+        sys_bin=$(command -v websocat)
+        sys_ver=$(get_websocat_version "$sys_bin")
+        if [ -n "$sys_ver" ] && [ "$sys_ver" != "$target_ver" ]; then
+            print_warning "系统 websocat 版本 ${sys_ver} 与脚本固定版本 ${target_ver} 不一致 (仍将使用系统版本)"
+        else
+            print_info "使用系统 websocat ${sys_ver:-未知版本} ($sys_bin)"
+        fi
+        WEBSOCAT_BIN="$sys_bin"
+        return 0
+    fi
+
+    # 2) 检查本地缓存的 .bin/websocat，版本不匹配则重新下载
+    if [ -x "$bin_path" ]; then
+        local local_ver
+        local_ver=$(get_websocat_version "$bin_path")
+        if [ "$local_ver" = "$target_ver" ]; then
+            print_info "使用本地 websocat $local_ver ($bin_path)"
+            WEBSOCAT_BIN="$bin_path"
+            return 0
+        fi
+        print_info "本地 websocat 版本为 ${local_ver:-未知}，与目标版本 $target_ver 不一致，重新下载..."
+        rm -f "$bin_path"
+    else
+        print_info "未找到 websocat，下载固定版本 v$target_ver ..."
+    fi
+
+    # 3) 下载固定版本到本地缓存
+    download_websocat "$bin_path" "$target_ver" || return 1
     WEBSOCAT_BIN="$bin_path"
-    print_info "websocat 已安装到 $bin_path"
 }
 
 # ==========================================================
