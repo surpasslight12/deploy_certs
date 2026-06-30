@@ -24,6 +24,11 @@ STATE_FILE_TRUE="$WORKSPACE_DIR/.last_deploy_truenas"
 LOG_FILE="$WORKSPACE_DIR/deploy_history.log"
 CONFIG_FILE="$WORKSPACE_DIR/deploy_config.json"
 
+# 日志轮换：超过 LOG_MAX_BYTES 时滚动到 .1 ... .N，最旧的丢弃
+# 可通过环境变量覆盖，默认 1 MiB × 5 份 = ~6 MiB 总量
+LOG_MAX_BYTES=${LOG_MAX_BYTES:-1048576}
+LOG_KEEP_FILES=${LOG_KEEP_FILES:-5}
+
 EXIT_SUCCESS=0
 EXIT_RUNTIME_ERROR=1
 
@@ -41,6 +46,24 @@ log_info()    { log "INFO: $1"; }
 log_warning() { log "WARNING: $1"; }
 log_error()   { log "ERROR: $1"; }
 log_success() { log "SUCCESS: $1"; }
+
+# 检查并轮换过大的部署日志。需在首次写日志前调用
+rotate_log_if_needed() {
+    [ -f "$LOG_FILE" ] || return 0
+    local size
+    size=$(stat -c %s "$LOG_FILE" 2>/dev/null) || return 0
+    [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+
+    # 丢弃最旧的一份
+    [ -f "${LOG_FILE}.${LOG_KEEP_FILES}" ] && rm -f "${LOG_FILE}.${LOG_KEEP_FILES}"
+    # 由旧到新依次后移: .N-1 -> .N, ..., .1 -> .2
+    local i
+    for (( i = LOG_KEEP_FILES - 1; i >= 1; i-- )); do
+        [ -f "${LOG_FILE}.${i}" ] && mv -f "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
+    done
+    # 当前日志 -> .1。轮换后首条日志会创建一个新的 LOG_FILE
+    mv -f "$LOG_FILE" "${LOG_FILE}.1"
+}
 
 print_usage() {
     log_info "用法:"
@@ -141,6 +164,9 @@ check_dependencies() {
 # ==========================================================
 # 参数处理
 # ==========================================================
+
+# 所有分支（子命令 / 主逻辑）写第一条日志前，先检查是否需要轮换
+rotate_log_if_needed
 
 # 卸载定时任务
 if [ "${1:-}" == "remove-cron" ]; then
