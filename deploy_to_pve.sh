@@ -11,6 +11,10 @@
 
 set -euo pipefail
 
+# 引入共享库 (日志、退出码、文件校验等)
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
 # ==========================================================
 # 常量定义
 # ==========================================================
@@ -22,36 +26,11 @@ DEFAULT_CERT=""
 DEFAULT_KEY=""
 REQUEST_TIMEOUT=30
 
-EXIT_SUCCESS=0
-EXIT_RUNTIME_ERROR=1
-EXIT_CERT_NOT_FOUND=2
-EXIT_KEY_NOT_FOUND=3
-EXIT_INVALID_INPUT=4
-
 # ==========================================================
 # 工具函数
 # ==========================================================
-print_info()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1"; }
-# shellcheck disable=SC2317
-print_warning() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $1"; }
-print_error()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
-print_success() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: $1"; }
-
 print_usage() {
     print_info "用法: $0 -H <host> -n <node> --token-id <id> --token-secret <secret> -c <cert> -k <key>"
-}
-
-validate_readable_file() {
-    local path="$1" label="$2" exit_code="$3"
-    if [ ! -f "$path" ]; then
-        print_error "${label}未找到: $path"
-        return "$exit_code"
-    fi
-    if [ ! -r "$path" ]; then
-        print_error "${label}不可读: $path"
-        return $EXIT_INVALID_INPUT
-    fi
-    return $EXIT_SUCCESS
 }
 
 # ==========================================================

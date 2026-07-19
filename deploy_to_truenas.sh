@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+# 引入共享库 (日志、退出码、文件校验等)
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
 # ==========================================================
 # 常量定义
 # ==========================================================
@@ -25,17 +29,12 @@ JOB_TIMEOUT=120
 POLL_INTERVAL=1
 AUTH_RETRIES=3
 RETRY_DELAY=2
+WS_RESPONSE_TIMEOUT=30
 
 # 固定 websocat 版本：本地 .bin/websocat 与此版本不一致时会自动重新下载
 # 升级时只需修改此常量
 WEBSOCAT_VERSION="1.14.1"
 WEBSOCAT_RELEASE_BASE="https://github.com/vi/websocat/releases/download"
-
-EXIT_SUCCESS=0
-EXIT_RUNTIME_ERROR=1
-EXIT_CERT_NOT_FOUND=2
-EXIT_KEY_NOT_FOUND=3
-EXIT_INVALID_INPUT=4
 
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBSOCAT_BIN=""
@@ -44,26 +43,8 @@ REQUEST_ID=0
 # ==========================================================
 # 工具函数
 # ==========================================================
-print_info()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1"; }
-print_warning() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $1"; }
-print_error()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
-print_success() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: $1"; }
-
 print_usage() {
     print_info "用法: $0 -H <host> -A <api_key> -c <cert> -k <key> [options]"
-}
-
-validate_readable_file() {
-    local path="$1" label="$2" exit_code="$3"
-    if [ ! -f "$path" ]; then
-        print_error "${label}未找到: $path"
-        return "$exit_code"
-    fi
-    if [ ! -r "$path" ]; then
-        print_error "${label}不可读: $path"
-        return $EXIT_INVALID_INPUT
-    fi
-    return $EXIT_SUCCESS
 }
 
 # ==========================================================
@@ -200,7 +181,7 @@ ws_call() {
     echo "$payload" >&"${WS_PROC[1]}"
 
     local line resp_id
-    while IFS= read -r -t 30 line <&"${WS_PROC[0]}"; do
+    while IFS= read -r -t "$WS_RESPONSE_TIMEOUT" line <&"${WS_PROC[0]}"; do
         [ -z "$line" ] && continue
 
         resp_id=$(echo "$line" | jq -r '.id // empty' 2>/dev/null) || continue
@@ -234,7 +215,10 @@ ws_call() {
 connect_and_authenticate() {
     local url="$1"
     local api_key="$2"
-    local attempt auth_result
+    local attempt auth_params auth_result
+
+    # 用 jq 构建参数，避免 api_key 中的特殊字符破坏 JSON
+    auth_params=$(jq -cn --arg k "$api_key" '[$k]')
 
     for ((attempt = 1; attempt <= AUTH_RETRIES; attempt++)); do
         ws_connect "$url" || {
@@ -245,7 +229,7 @@ connect_and_authenticate() {
             continue
         }
 
-        auth_result=$(ws_call "auth.login_with_api_key" "[\"$api_key\"]" 2>/dev/null) || auth_result=""
+        auth_result=$(ws_call "auth.login_with_api_key" "$auth_params" 2>/dev/null) || auth_result=""
         if [ "$auth_result" = "true" ]; then
             return 0
         fi
@@ -296,6 +280,18 @@ wait_for_job() {
     return 1
 }
 
+# 从 system.general.config 响应中提取当前 UI 证书 ID
+# ui_certificate 字段可能为对象/数字/数字字符串
+parse_ui_cert_id() {
+    jq -r '
+        .ui_certificate |
+        if type == "object" then .id
+        elif type == "number" then .
+        elif type == "string" and test("^[0-9]+$") then tonumber
+        else empty
+        end // empty' 2>/dev/null
+}
+
 # ==========================================================
 # 参数解析
 # ==========================================================
@@ -328,8 +324,7 @@ done
 
 # 如果未指定证书名称则自动生成
 if [ -z "$CERT_NAME" ]; then
-    SHORT=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)
-    CERT_NAME="${PREFIX}$(date +%Y%m%d)_${SHORT}"
+    CERT_NAME="${PREFIX}$(date +%Y%m%d)_$(gen_random_suffix 4)"
 fi
 
 # ==========================================================
@@ -385,12 +380,7 @@ CONFIG_RESP=$(ws_call "system.general.config") || {
     exit $EXIT_RUNTIME_ERROR
 }
 
-ACTIVE_CERT_ID=$(echo "$CONFIG_RESP" | jq -r '
-    if .ui_certificate | type == "object" then .ui_certificate.id
-    elif .ui_certificate | type == "number" then .ui_certificate
-    elif .ui_certificate | type == "string" and test("^[0-9]+$") then .ui_certificate | tonumber
-    else empty
-    end // empty' 2>/dev/null)
+ACTIVE_CERT_ID=$(echo "$CONFIG_RESP" | parse_ui_cert_id)
 
 # ==========================================================
 # 步骤 3: 检查同名证书是否已存在
@@ -481,47 +471,30 @@ print_info "清理旧证书 (保留最新 $KEEP 个)..."
 
 CONFIG_RESP2=$(ws_call "system.general.config" 2>/dev/null) || CONFIG_RESP2=""
 if [ -n "$CONFIG_RESP2" ]; then
-    ACTIVE_CERT_ID=$(echo "$CONFIG_RESP2" | jq -r '
-        if .ui_certificate | type == "object" then .ui_certificate.id
-        elif .ui_certificate | type == "number" then .ui_certificate
-        else empty
-        end // empty' 2>/dev/null)
+    ACTIVE_CERT_ID=$(echo "$CONFIG_RESP2" | parse_ui_cert_id)
 fi
 
 ALL_CERTS=$(ws_call "certificate.query" "[[], {\"order_by\": [\"-id\"]}]" 2>/dev/null) || ALL_CERTS="[]"
 
-MANAGED_CERTS=$(echo "$ALL_CERTS" | jq --arg pfx "$PREFIX" \
-    '[.[] | select((.name // "") | startswith($pfx))]' 2>/dev/null) || MANAGED_CERTS="[]"
+# 筛选托管证书中超出 KEEP 数量的部分，输出 "id<TAB>name" 列表
+PRUNE_LIST=$(echo "$ALL_CERTS" | jq -r --arg pfx "$PREFIX" --argjson keep "$KEEP" \
+    '[.[] | select((.name // "") | startswith($pfx))] | .[$keep:][] | "\(.id)\t\(.name)"' 2>/dev/null) || PRUNE_LIST=""
 
-MANAGED_COUNT=$(echo "$MANAGED_CERTS" | jq 'length')
-IDX=0
-while [ "$IDX" -lt "$MANAGED_COUNT" ]; do
-    if [ "$IDX" -lt "$KEEP" ]; then
-        IDX=$((IDX + 1))
-        continue
-    fi
-
-    CERT_ID=$(echo "$MANAGED_CERTS" | jq -r ".[$IDX].id")
-    CERT_NM=$(echo "$MANAGED_CERTS" | jq -r ".[$IDX].name")
+while IFS=$'\t' read -r CERT_ID CERT_NM; do
+    [ -z "$CERT_ID" ] && continue
 
     if [ "$CERT_ID" = "$ACTIVE_CERT_ID" ]; then
         print_warning "跳过删除 $CERT_NM (ID: $CERT_ID)，该证书当前绑定到 UI"
-        IDX=$((IDX + 1))
         continue
     fi
 
     print_info "清理旧证书: $CERT_NM (ID: $CERT_ID)..."
-    DEL_JOB=$(ws_call "certificate.delete" "[$CERT_ID, false]" 2>/dev/null) || {
-        IDX=$((IDX + 1))
-        continue
-    }
+    DEL_JOB=$(ws_call "certificate.delete" "[$CERT_ID, false]" 2>/dev/null) || continue
     DEL_JOB_ID=$(echo "$DEL_JOB" | jq -r '. // empty')
     if [ -n "$DEL_JOB_ID" ] && [ "$DEL_JOB_ID" != "null" ]; then
         wait_for_job "$DEL_JOB_ID" > /dev/null 2>&1 || true
     fi
-
-    IDX=$((IDX + 1))
-done
+done <<< "$PRUNE_LIST"
 
 # ==========================================================
 # 步骤 7: 重启 UI

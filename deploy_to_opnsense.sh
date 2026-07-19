@@ -13,6 +13,10 @@
 
 set -euo pipefail
 
+# 引入共享库 (日志、退出码、文件校验等)
+# shellcheck source=common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
 # ==========================================================
 # 常量定义
 # ==========================================================
@@ -31,35 +35,11 @@ DEFAULT_KEEP=2
 API_TIMEOUT=20
 SSH_TIMEOUT=15
 
-EXIT_SUCCESS=0
-EXIT_RUNTIME_ERROR=1
-EXIT_CERT_NOT_FOUND=2
-EXIT_KEY_NOT_FOUND=3
-EXIT_INVALID_INPUT=4
-
 # ==========================================================
 # 工具函数
 # ==========================================================
-print_info()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1"; }
-print_warning() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $1"; }
-print_error()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }
-print_success() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] SUCCESS: $1"; }
-
 print_usage() {
     print_info "用法: $0 -H <host> -u <user> -P <password> --api-key <key> --api-secret <secret> -c <cert> -k <key>"
-}
-
-validate_readable_file() {
-    local path="$1" label="$2" exit_code="$3"
-    if [ ! -f "$path" ]; then
-        print_error "${label}未找到: $path"
-        return "$exit_code"
-    fi
-    if [ ! -r "$path" ]; then
-        print_error "${label}不可读: $path"
-        return $EXIT_INVALID_INPUT
-    fi
-    return $EXIT_SUCCESS
 }
 
 # ==========================================================
@@ -80,7 +60,7 @@ generate_cert_descr() {
     local date_str
     date_str=$(date +%Y%m%d)
     local short
-    short=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 4)
+    short=$(gen_random_suffix 4)
     if [ -n "$norm" ]; then
         echo "${norm}_${date_str}_${short}"
     else
@@ -122,16 +102,17 @@ api_request() {
 }
 
 # 通过 SSH 在远程 OPNsense 上执行命令
+# 使用 SSHPASS 环境变量 + sshpass -e，避免密码出现在进程列表中
 ssh_exec() {
     local cmd="$1"
-    sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
+    SSHPASS="$PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
         -p "$PORT" "${USER}@${HOST}" "$cmd" 2>&1
 }
 
 # 通过 SCP 上传本地文件到远程
 scp_upload() {
     local local_path="$1" remote_path="$2"
-    sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
+    SSHPASS="$PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
         -P "$PORT" "$local_path" "${USER}@${HOST}:${remote_path}" 2>&1
 }
 
@@ -343,7 +324,7 @@ print_info "将导入的证书绑定到 WebGUI..."
 TMP_PHP=$(mktemp /tmp/opns_bind_XXXXXXXX.php)
 echo "$PHP_BINDER" > "$TMP_PHP"
 
-RID=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+RID=$(gen_random_suffix 8)
 REMOTE_PHP="${REMOTE_DIR%/}/${RID}_bind.php"
 
 scp_upload "$TMP_PHP" "$REMOTE_PHP" > /dev/null 2>&1 || {
