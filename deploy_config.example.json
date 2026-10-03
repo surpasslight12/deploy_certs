@@ -1,0 +1,74 @@
+{
+  "_说明": [
+    "【用法】复制本文件为同目录下的 deploy_config.json，然后填入真实值即可（deploy_config.json 已被 .gitignore 忽略，不会误提交）。",
+    "【平台可选】pve / opnsense / truenas 三个平台段均为可选：删除不需要的段即可跳过该平台，但至少要保留一个。",
+    "【注释字段】以 _ 开头的字段仅作说明用途，脚本会自动忽略；本示例中的证书路径以 acme.sh 默认目录为例。",
+    "【自动任务】配置完成后可执行 bash deploy_all.sh setup-cron 让本脚本跟随 acme.sh 定时运行；remove-cron 可卸载。",
+    "【验证机制】每个平台可设 verify_port：部署后脚本会连接该端口抓取远端证书指纹与本地比对；设为 0 可跳过验证。"
+  ],
+
+  "pve": {
+    "_说明": [
+      "Proxmox VE：通过官方 REST API 上传证书并重载 pveproxy（仅支持 API Token 认证）。",
+      "必填：host / token_id / token_secret / cert / key",
+      "可选：node（节点名，默认 pve）、verify_port（验证端口，默认 8006，0=跳过）",
+      "token_id 格式为 USER@REALM!TOKENID，例如 root@pam!deploycerts；token_secret 只在创建时显示一次。",
+      "注意：PVE 9 起节点证书要求 RSA ≥ 2048 位（acme.sh 默认满足）。"
+    ],
+    "host": "192.168.1.10",
+    "node": "pve",
+    "token_id": "root@pam!deploycerts",
+    "token_secret": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "cert": "/root/.acme.sh/example.com_ecc/fullchain.cer",
+    "key": "/root/.acme.sh/example.com_ecc/example.com.key",
+    "verify_port": 8006
+  },
+
+  "opnsense": {
+    "_说明": [
+      "OPNsense：通过官方 Trust API 导入/清理证书，再经 SSH 更新 WebGUI ssl-certref 绑定并重载（需 OPNsense 24.7+）。",
+      "必填：host / user / api_key / api_secret / cert / key",
+      "SSH 认证：password 与 ssh_key 二选一（密钥优先）；使用密钥时无需安装 sshpass。",
+      "可选：port（SSH 端口，默认 22）、api_port（API 端口，默认 443）、remote_dir（远程临时目录，默认 /tmp）、prefix（托管证书名前缀，默认 opnsense_certs_）、keep（保留最新数量，默认 2）、verify_port（默认与 api_port 相同，0=跳过）",
+      "api_key / api_secret 在 OPNsense「系统 → 访问 → 用户」中为对应用户生成。",
+      "本平台额外依赖 ssh / scp（deploy_all.sh 会自动检查）；SSH 密码认证还需要 sshpass。"
+    ],
+    "host": "192.168.1.1",
+    "port": 22,
+    "user": "root",
+    "password": "在此填写_SSH_登录密码_或改用ssh_key",
+    "ssh_key": null,
+    "api_key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "api_secret": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+    "api_port": 443,
+    "cert": "/root/.acme.sh/example.com_ecc/fullchain.cer",
+    "key": "/root/.acme.sh/example.com_ecc/example.com.key",
+    "remote_dir": "/tmp",
+    "prefix": "opnsense_certs_",
+    "keep": 2,
+    "verify_port": 443
+  },
+
+  "truenas": {
+    "_说明": [
+      "TrueNAS：通过 WebSocket JSON-RPC 2.0 导入证书、绑定 UI 并清理旧证书（25.04 起弃用 REST API v2.0）。",
+      "host 支持带端口（如 10.0.0.5:8443）；部署后验证会剥离 host 中的端口，统一使用 verify_port 连接。",
+      "必填：host / api_key / cert / key",
+      "username：API 密钥所属用户，默认 root；TrueNAS 25.10+ 使用 auth.login_ex 认证，必须与密钥所属用户一致，否则报 AUTH_ERR。",
+      "可选：name（证书名，默认自动生成 truenas_certs_日期_随机，null=自动）、prefix（托管证书名前缀，默认 truenas_certs_）、keep（保留最新数量，默认 2）、ws_path（WebSocket 路径，默认 /api/current）、verify_port（验证端口，默认 443，0=跳过）",
+      "api_key 为创建密钥时生成的完整字符串，形如 1-xxxxxxxx...；脚本会优先使用新登录接口并在旧版本自动回退。",
+      "scram：true 时使用 SCRAM-SHA-512 认证（官方推荐，抗重放；LEVEL_2/LEVEL_3 高安全级别下必须使用；需要 OpenSSL 3.0+，无需预计算数据）。"
+    ],
+    "host": "192.168.1.20",
+    "api_key": "1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "username": "root",
+    "scram": false,
+    "cert": "/root/.acme.sh/example.com_ecc/fullchain.cer",
+    "key": "/root/.acme.sh/example.com_ecc/example.com.key",
+    "name": null,
+    "prefix": "truenas_certs_",
+    "keep": 2,
+    "ws_path": "/api/current",
+    "verify_port": 443
+  }
+}

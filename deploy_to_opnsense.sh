@@ -5,9 +5,10 @@
 # 采用 "官方 Trust API + SSH 绑定" 的混合实现：
 #   - 通过官方 Trust API 导入/查询/删除证书并触发 reconfigure
 #   - 通过 SSH 上传 PHP 脚本更新 WebGUI ssl-certref 绑定并重载
+#   - SSH 认证支持密码 (-P，需 sshpass) 或私钥 (-i，推荐)；同时提供时优先密钥
 #
 # 用法:
-#   deploy_to_opnsense.sh -H <host> -u <user> -P <password> \
+#   deploy_to_opnsense.sh -H <host> -u <user> [-P <password> | -i <key>] \
 #       -c <cert> -k <key> --api-key <key> --api-secret <secret> [options]
 # ==========================================================
 
@@ -32,14 +33,21 @@ DEFAULT_KEY=""
 DEFAULT_REMOTE_DIR="/tmp"
 DEFAULT_PREFIX="opnsense_certs_"
 DEFAULT_KEEP=2
+DEFAULT_SSH_KEY=""
 API_TIMEOUT=20
 SSH_TIMEOUT=15
+
+# SSH/SCP 基础命令 (在输入验证阶段按 密钥/密码 模式初始化)
+SSH_COMMON_OPTS=()
+SSH_CMD=()
+SCP_CMD=()
 
 # ==========================================================
 # 工具函数
 # ==========================================================
 print_usage() {
-    print_info "用法: $0 -H <host> -u <user> -P <password> --api-key <key> --api-secret <secret> -c <cert> -k <key>"
+    print_info "用法: $0 -H <host> -u <user> [-P <password> | -i <key>] --api-key <key> --api-secret <secret> -c <cert> -k <key> [options]"
+    print_info "  -i, --ssh-key <path>  SSH 私钥路径 (与 -P 二选一; 同时提供时优先使用密钥)"
 }
 
 # ==========================================================
@@ -102,18 +110,16 @@ api_request() {
 }
 
 # 通过 SSH 在远程 OPNsense 上执行命令
-# 使用 SSHPASS 环境变量 + sshpass -e，避免密码出现在进程列表中
+# SSH_CMD 由输入验证阶段构建: 密钥模式 (ssh -i) 或 密码模式 (sshpass -e + SSHPASS)
 ssh_exec() {
     local cmd="$1"
-    SSHPASS="$PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
-        -p "$PORT" "${USER}@${HOST}" "$cmd" 2>&1
+    SSHPASS="$PASSWORD" "${SSH_CMD[@]}" -p "$PORT" "${USER}@${HOST}" "$cmd" 2>&1
 }
 
 # 通过 SCP 上传本地文件到远程
 scp_upload() {
     local local_path="$1" remote_path="$2"
-    SSHPASS="$PASSWORD" sshpass -e scp -o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT" \
-        -P "$PORT" "$local_path" "${USER}@${HOST}:${remote_path}" 2>&1
+    SSHPASS="$PASSWORD" "${SCP_CMD[@]}" -P "$PORT" "$local_path" "${USER}@${HOST}:${remote_path}" 2>&1
 }
 
 # ==========================================================
@@ -123,6 +129,7 @@ HOST="$DEFAULT_HOST"
 PORT="$DEFAULT_PORT"
 USER="$DEFAULT_USER"
 PASSWORD="$DEFAULT_PASSWORD"
+SSH_KEY="$DEFAULT_SSH_KEY"
 API_KEY="$DEFAULT_API_KEY"
 API_SECRET="$DEFAULT_API_SECRET"
 API_PORT="$DEFAULT_API_PORT"
@@ -138,6 +145,7 @@ while [[ $# -gt 0 ]]; do
         -p|--port)        PORT="$2"; shift 2 ;;
         -u|--user)        USER="$2"; shift 2 ;;
         -P|--password)    PASSWORD="$2"; shift 2 ;;
+        -i|--ssh-key)     SSH_KEY="$2"; shift 2 ;;
         --api-key)        API_KEY="$2"; shift 2 ;;
         --api-secret)     API_SECRET="$2"; shift 2 ;;
         --api-port)       API_PORT="$2"; shift 2 ;;
@@ -159,11 +167,24 @@ API_BASE_URL="https://${HOST}:${API_PORT}/api"
 # ==========================================================
 # 输入验证
 # ==========================================================
-print_info "使用配置: HOST=$HOST, USER=$USER, API=已启用, CERT=$CERT, KEY=$KEY"
-
-if [ -z "$HOST" ] || [ -z "$USER" ] || [ -z "$PASSWORD" ]; then
-    print_error "必须提供 host、user 和 password"
+if [ -z "$HOST" ] || [ -z "$USER" ]; then
+    print_error "必须提供 host 和 user"
     exit $EXIT_INVALID_INPUT
+fi
+
+# SSH 认证: 密码与密钥二选一 (同时提供时优先密钥)
+if [ -z "$PASSWORD" ] && [ -z "$SSH_KEY" ]; then
+    print_error "必须提供 SSH 密码 (-P/--password) 或 SSH 私钥 (-i/--ssh-key)"
+    exit $EXIT_INVALID_INPUT
+fi
+if [ -n "$SSH_KEY" ]; then
+    if [ ! -r "$SSH_KEY" ]; then
+        print_error "SSH 私钥不存在或不可读: $SSH_KEY"
+        exit $EXIT_INVALID_INPUT
+    fi
+    if [ -n "$PASSWORD" ]; then
+        print_warning "同时提供了 SSH 密码与密钥，将使用密钥认证 (-i 优先)"
+    fi
 fi
 
 if [ -z "$API_KEY" ] || [ -z "$API_SECRET" ]; then
@@ -171,10 +192,23 @@ if [ -z "$API_KEY" ] || [ -z "$API_SECRET" ]; then
     exit $EXIT_INVALID_INPUT
 fi
 
-if [ "$KEEP" -lt 1 ]; then
-    print_error "keep 至少为 1"
+if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
+    print_error "keep 必须为不小于 1 的整数"
     exit $EXIT_INVALID_INPUT
 fi
+
+# 构建 SSH/SCP 基础命令: 密钥模式禁用交互提示; 密码模式经 sshpass -e 传递 (密码不出现在进程列表)
+SSH_COMMON_OPTS=(-o StrictHostKeyChecking=no -o ConnectTimeout="$SSH_TIMEOUT")
+if [ -n "$SSH_KEY" ]; then
+    SSH_CMD=(ssh -i "$SSH_KEY" -o BatchMode=yes -o PreferredAuthentications=publickey "${SSH_COMMON_OPTS[@]}")
+    SCP_CMD=(scp -i "$SSH_KEY" -o BatchMode=yes -o PreferredAuthentications=publickey "${SSH_COMMON_OPTS[@]}")
+    SSH_MODE="key:$SSH_KEY"
+else
+    SSH_CMD=(sshpass -e ssh "${SSH_COMMON_OPTS[@]}")
+    SCP_CMD=(sshpass -e scp "${SSH_COMMON_OPTS[@]}")
+    SSH_MODE="password"
+fi
+print_info "使用配置: HOST=$HOST, USER=$USER, SSH=$SSH_MODE, API=已启用, CERT=$CERT, KEY=$KEY"
 
 print_info "验证本地证书文件..."
 validate_readable_file "$CERT" "证书文件" $EXIT_CERT_NOT_FOUND
@@ -247,8 +281,16 @@ if ($dom->save($conf) === false) {
 }
 
 echo "Successfully updated WebGUI ssl-certref in /conf/config.xml\n";
+
+$rout = [];
 @exec('/usr/local/sbin/configctl webgui restart 2>&1', $rout, $rrc);
-echo implode("\n", $rout) . "\n";
+if (!empty($rout)) {
+    echo implode("\n", $rout) . "\n";
+}
+if ($rrc !== 0) {
+    echo "ERROR: configctl webgui restart failed (rc={$rrc})\n";
+    exit(6);
+}
 echo "SUCCESS: WebGUI certificate binding updated and reloaded.\n";
 exit(0);
 ?>
@@ -366,7 +408,7 @@ SEARCH_RESULT=$(api_request POST "/trust/cert/search" "$SEARCH_PAYLOAD") || {
 
 # 筛选 descr 以规范化前缀开头的证书，收集超出 KEEP 数量的 UUID
 PRUNE_UUIDS=$(echo "$SEARCH_RESULT" | jq -r --arg pfx "$NORM_PREFIX" --argjson keep "$KEEP" \
-    '[.rows[] | select(.descr | startswith($pfx))] | .[$keep:][] | .uuid // empty')
+    '[.rows[] | select((.descr // "") | startswith($pfx))] | .[$keep:][] | .uuid // empty') || PRUNE_UUIDS=""
 
 REMOVED=0
 for uuid in $PRUNE_UUIDS; do

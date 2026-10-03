@@ -30,7 +30,7 @@ REQUEST_TIMEOUT=30
 # 工具函数
 # ==========================================================
 print_usage() {
-    print_info "用法: $0 -H <host> -n <node> --token-id <id> --token-secret <secret> -c <cert> -k <key>"
+    print_info "用法: $0 -H <host> [-n <node>] --token-id <id> --token-secret <secret> -c <cert> -k <key>"
 }
 
 # ==========================================================
@@ -113,11 +113,11 @@ HTTP_CODE=$(curl -s -o "$PVE_TMP" -w "%{http_code}" \
 RESPONSE_BODY=$(cat "$PVE_TMP" 2>/dev/null)
 rm -f "$PVE_TMP"
 
-if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-    print_error "证书上传失败 (HTTP $HTTP_CODE): $RESPONSE_BODY"
+if ! [[ "$HTTP_CODE" =~ ^[0-9]+$ ]] || [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+    print_error "证书上传失败 (HTTP ${HTTP_CODE:-无响应}): $RESPONSE_BODY"
     exit $EXIT_RUNTIME_ERROR
 fi
 
-print_info "PVE 正在处理证书并在后台重启 pveproxy..."
+print_info "证书已上传，pveproxy 已重载..."
 print_success "证书已部署到 $HOST"
 exit $EXIT_SUCCESS

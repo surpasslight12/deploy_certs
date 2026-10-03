@@ -17,9 +17,10 @@
 | ------ | -------- |
 | deploy_all.sh | **主入口脚本**。加载配置、检查依赖、按平台注册表调度子脚本、部署后闭环验证（指纹比对）、设置/卸载定时任务。 |
 | common.sh | **共享库**。提供统一的日志输出、退出码、文件校验与随机后缀工具，供各部署子脚本 source 引入。 |
+| deploy_config.example.json | **配置模板**。包含 PVE / OPNsense / TrueNAS 三个平台全部字段的完整示例与默认值说明；首次使用时复制为 `deploy_config.json` 并填入真实值。 |
 | deploy_to_pve.sh | 利用 Proxmox VE 官方 REST API 将证书上传到节点并触发后台 pveproxy 重载。 |
 | deploy_to_opnsense.sh | 采用 "官方 Trust API + SSH 绑定" 的混合实现：用官方 API 导入/清理证书，再通过 SSH 更新 Web GUI 证书绑定并重载。 |
-| deploy_to_truenas.sh | 采用 TrueNAS WebSocket JSON-RPC 2.0 API (通过 websocat) 导入证书、更新 UI 绑定并清理旧证书。 |
+| deploy_to_truenas.sh | 采用 TrueNAS WebSocket JSON-RPC 2.0 API (通过 websocat) 导入证书、更新 UI 绑定并清理旧证书。认证优先使用 25.10+ 的 `auth.login_ex` (API_KEY_PLAIN)，可选 SCRAM-SHA-512（`scram: true`），旧版本自动回退 `auth.login_with_api_key`。 |
 
 ### 系统依赖
 | 工具 | 用途 | 安装命令 |
@@ -27,13 +28,15 @@
 | curl | HTTP/HTTPS 请求 | 通常已预装 |
 | jq | JSON 解析 | sudo apt install -y jq |
 | openssl | 证书指纹计算与部署后验证 | 通常已预装 |
-| sshpass | SSH 密码认证（仅 OPNsense 需要） | sudo apt install -y sshpass |
+| sshpass | SSH 密码认证（仅 OPNsense 且未使用 SSH 密钥时需要） | sudo apt install -y sshpass |
 | ssh / scp | 远程执行与文件传输（仅 OPNsense 需要） | 通常已预装 |
 | websocat | TrueNAS WebSocket 通信 | 脚本自动下载（也可手动安装） |
 
-> **依赖按需检查**: deploy_all.sh 只检查启用的平台实际需要的依赖。例如不使用 OPNsense 时无需安装 sshpass。
+> **依赖按需检查**: deploy_all.sh 只检查启用的平台实际需要的依赖。例如不使用 OPNsense 时无需安装 sshpass；使用 OPNsense 的 SSH 密钥认证（`ssh_key`）时同样无需 sshpass。
 
 > **注意**: TrueNAS 25.04 弃用了 REST API v2.0，26+ 完全移除。TrueNAS 部署脚本使用 WebSocket JSON-RPC 2.0 协议，通过 `websocat` 实现。如果系统 PATH 中没有 `websocat`，脚本会自动从 GitHub 下载到 `.bin/` 目录。
+>
+> **认证方式变更**: TrueNAS 25.10 起登录接口改为 `auth.login_ex`（`API_KEY_PLAIN` 机制），旧的 `auth.login_with_api_key` 已弃用并将在后续版本移除。新接口要求提供 API 密钥所属的**用户名**——请在配置中增加 `truenas.username`（默认 `root`）。脚本会自动优先使用新接口，在旧版本上自动回退旧接口，无需额外配置。
 
 ---
 
@@ -41,6 +44,8 @@
 
 ### 1. 修改集中配置文件 (非常重要)
 在使用工具前，请只修改脚本目录下的 deploy_config.json。deploy_all.sh 会统一读取这个文件，并把参数分别传给 PVE、OPNsense、TrueNAS 三个部署脚本。
+
+首次使用可直接复制 `deploy_config.example.json` 为 `deploy_config.json`——该模板包含三个平台**全部字段**的完整示例、必填/可选项标注与默认值说明（以 `_` 开头的说明字段会被脚本自动忽略），按需删除不需要的平台段即可。
 
 各平台 (pve / opnsense / truenas) 的配置段均为**可选**——未在配置文件中定义的平台会自动跳过。
 `cert` 字段用于推送内容、变更检测和部署后验证：脚本会计算证书文件的 SHA256 指纹，仅当指纹与上次成功部署不同时才触发部署。三个平台彼此独立、互不影响。
@@ -54,6 +59,14 @@ PVE 仅支持官方 API Token 认证。
 OPNsense 采用混合实现。
 - api_key 和 api_secret 是必填项，脚本会通过官方 Trust API 导入证书、清理旧证书并触发 trust reconfigure。
 - 由于 Web GUI 的 ssl-certref 绑定仍然依赖旧配置路径，脚本仍会通过 SSH 更新该绑定并重载 Web GUI。
+- SSH 认证支持密码（`password`，需要 sshpass）或私钥（`ssh_key`，推荐，无需 sshpass）两种方式，任选其一；两者同时提供时优先使用密钥。
+
+TrueNAS 认证方式（25.10 起变更）。
+- host、api_key、cert、key 为必填项；api_key 是创建 API 密钥时生成的完整字符串（形如 `1-xxxxxxxx...`）。
+- username 为 API 密钥所属的用户（默认 `root`）。TrueNAS 25.10+ 使用 `auth.login_ex`（`API_KEY_PLAIN`）认证，必须提供正确的用户名，否则会返回 `AUTH_ERR` 认证失败。
+- 可选字段 `scram: true` 启用 SCRAM-SHA-512 认证（官方推荐，抗重放；LEVEL_2/LEVEL_3 等高安全级别下必须使用；需要 OpenSSL 3.0+）。脚本使用原始密钥现场计算，无需预计算 SCRAM 数据。
+- 旧版 TrueNAS（< 25.10）在检测到 `auth.login_ex` 不存在时会自动回退 `auth.login_with_api_key`，无需修改配置。
+- 高安全级别（LEVEL_2/LEVEL_3，通常仅 STIG 场景）下 `API_KEY_PLAIN` 会被服务器拒绝，此时开启 `scram: true` 即可通过 SCRAM-SHA-512 完成认证；服务器不支持时会自动回退。
 
 ### 2. 触发一次手动部署
 配置完成后，直接运行命令：
@@ -84,3 +97,5 @@ OPNsense 采用混合实现。
 - **部署后如何确认证书已生效？** 脚本默认在部署完成后自动抓取远端证书指纹与本地比对（带重试），结果会显示在日志总结中。若想跳过验证，将对应平台的 `verify_port` 设为 `0`。
 - **如何新增其他平台（如 Synology / Unifi）？** 参考 deploy_all.sh 中的 "平台插件定义" 一节，实现 `platform_init_<名>` 和 `platform_cmd_<名>` 两个函数，并加入 `PLATFORMS` / `PLATFORM_LABELS` 数组即可。
 - **TrueNAS 部署后看到多个证书怎么办？** TrueNAS 脚本对于含有 truenas_certs_ 前缀的证书会保证仅保留最新的 2 份。手动创建的其他前缀证书不受影响，需要去面板手动删除。
+- **TrueNAS 提示 "Method does not exist" 或认证失败怎么办？** "Method does not exist" 说明该版本已移除或尚不支持旧登录接口；TrueNAS 25.10+ 的新认证需要在 `deploy_config.json` 的 `truenas` 段中配置 `username`（API 密钥所属用户，默认 `root`）。若提示 `AUTH_ERR`，请检查用户名是否与密钥所属用户一致、密钥是否已过期或被吊销。
+- **运行后会生成哪些文件？** 状态文件 `.last_deploy_<平台>`（记录上次成功部署的证书指纹，用于变更检测）、日志 `deploy_history.log`（超限自动轮换为 `.1`~`.5`）；这些运行产物均已在 `.gitignore` 中忽略，不会误提交。

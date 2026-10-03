@@ -88,6 +88,7 @@ print_usage() {
     log_info "  $0             一键执行所有平台的证书部署"
     log_info "  $0 setup-cron  检查 acme.sh 并自动将自己配置为定时任务"
     log_info "  $0 remove-cron 卸载本脚本的定时任务"
+    log_info "  $0 -h|--help   显示本帮助"
 }
 
 # ==========================================================
@@ -97,15 +98,18 @@ print_usage() {
 # jq 辅助函数: 读取值，空值返回默认值
 jq_val() { jq -r "$1 // \"$2\"" "$CONFIG_FILE"; }
 
-# jq 辅助函数: 读取必要字段，缺失时报错退出
-jq_req() {
-    local val
-    val=$(jq -r "$1 // empty" "$CONFIG_FILE")
+# jq 辅助函数: 读取必要字段到指定全局变量，缺失时报错退出
+# 注意: 不能用 $(jq_req ...) 形式 —— exit 只会终止命令替换的子 shell，
+#       主脚本会带着空值继续运行，因此改用 printf -v 直接赋值
+# 用法: req_val <变量名> <jq路径>
+req_val() {
+    local var="$1" path="$2" val
+    val=$(jq -r "$path // empty" "$CONFIG_FILE")
     if [ -z "$val" ]; then
-        log_error "配置文件缺少必要字段: $1"
+        log_error "配置文件缺少必要字段: $path"
         exit "$EXIT_RUNTIME_ERROR"
     fi
-    echo "$val"
+    printf -v "$var" '%s' "$val"
 }
 
 # 判断平台配置段是否存在 (平台可选: 未定义的平台自动跳过)
@@ -158,12 +162,12 @@ load_config() {
 # ==========================================================
 
 platform_init_pve() {
-    CFG_PVE_HOST=$(jq_req '.pve.host')
+    req_val CFG_PVE_HOST '.pve.host'
     CFG_PVE_NODE=$(jq_val '.pve.node' 'pve')
-    CFG_PVE_TOKEN_ID=$(jq_req '.pve.token_id')
-    CFG_PVE_TOKEN_SECRET=$(jq_req '.pve.token_secret')
-    CFG_PVE_CERT=$(jq_req '.pve.cert')
-    CFG_PVE_KEY=$(jq_req '.pve.key')
+    req_val CFG_PVE_TOKEN_ID '.pve.token_id'
+    req_val CFG_PVE_TOKEN_SECRET '.pve.token_secret'
+    req_val CFG_PVE_CERT '.pve.cert'
+    req_val CFG_PVE_KEY '.pve.key'
 
     P_CERT="$CFG_PVE_CERT"
     P_VERIFY_HOST="$CFG_PVE_HOST"
@@ -185,15 +189,21 @@ platform_cmd_pve() {
 }
 
 platform_init_opnsense() {
-    CFG_OPNS_HOST=$(jq_req '.opnsense.host')
+    req_val CFG_OPNS_HOST '.opnsense.host'
     CFG_OPNS_PORT=$(jq_val '.opnsense.port' '22')
-    CFG_OPNS_USER=$(jq_req '.opnsense.user')
-    CFG_OPNS_PASSWORD=$(jq_req '.opnsense.password')
-    CFG_OPNS_API_KEY=$(jq_req '.opnsense.api_key')
-    CFG_OPNS_API_SECRET=$(jq_req '.opnsense.api_secret')
+    req_val CFG_OPNS_USER '.opnsense.user'
+    # SSH 认证: password 与 ssh_key 二选一 (密钥优先)
+    CFG_OPNS_PASSWORD=$(jq_val '.opnsense.password' '')
+    CFG_OPNS_SSH_KEY=$(jq_val '.opnsense.ssh_key' '')
+    if [ -z "$CFG_OPNS_PASSWORD" ] && [ -z "$CFG_OPNS_SSH_KEY" ]; then
+        log_error "opnsense 需要提供 password 或 ssh_key 之一"
+        exit "$EXIT_RUNTIME_ERROR"
+    fi
+    req_val CFG_OPNS_API_KEY '.opnsense.api_key'
+    req_val CFG_OPNS_API_SECRET '.opnsense.api_secret'
     CFG_OPNS_API_PORT=$(jq_val '.opnsense.api_port' '443')
-    CFG_OPNS_CERT=$(jq_req '.opnsense.cert')
-    CFG_OPNS_KEY=$(jq_req '.opnsense.key')
+    req_val CFG_OPNS_CERT '.opnsense.cert'
+    req_val CFG_OPNS_KEY '.opnsense.key'
     CFG_OPNS_REMOTE_DIR=$(jq_val '.opnsense.remote_dir' '/tmp')
     CFG_OPNS_PREFIX=$(jq_val '.opnsense.prefix' 'opnsense_certs_')
     CFG_OPNS_KEEP=$(jq_val '.opnsense.keep' '2')
@@ -211,7 +221,6 @@ platform_cmd_opnsense() {
         -H "$CFG_OPNS_HOST"
         -p "$CFG_OPNS_PORT"
         -u "$CFG_OPNS_USER"
-        -P "$CFG_OPNS_PASSWORD"
         -c "$CFG_OPNS_CERT"
         -k "$CFG_OPNS_KEY"
         -d "$CFG_OPNS_REMOTE_DIR"
@@ -221,13 +230,23 @@ platform_cmd_opnsense() {
         --prefix "$CFG_OPNS_PREFIX"
         --keep "$CFG_OPNS_KEEP"
     )
+    # SSH 认证: 提供密钥时优先密钥 (无需 sshpass)
+    if [ -n "$CFG_OPNS_SSH_KEY" ]; then
+        _c+=( -i "$CFG_OPNS_SSH_KEY" )
+    else
+        _c+=( -P "$CFG_OPNS_PASSWORD" )
+    fi
 }
 
 platform_init_truenas() {
-    CFG_TRUE_HOST=$(jq_req '.truenas.host')
-    CFG_TRUE_API_KEY=$(jq_req '.truenas.api_key')
-    CFG_TRUE_CERT=$(jq_req '.truenas.cert')
-    CFG_TRUE_KEY=$(jq_req '.truenas.key')
+    req_val CFG_TRUE_HOST '.truenas.host'
+    req_val CFG_TRUE_API_KEY '.truenas.api_key'
+    # API 密钥所属用户名 (TrueNAS 25.10+ 的 auth.login_ex 认证必需, 默认 root)
+    CFG_TRUE_USERNAME=$(jq_val '.truenas.username' 'root')
+    # 可选: SCRAM-SHA-512 认证 (适配 LEVEL_2/3 安全级别; 需 OpenSSL 3.0+)
+    CFG_TRUE_SCRAM=$(jq_val '.truenas.scram' 'false')
+    req_val CFG_TRUE_CERT '.truenas.cert'
+    req_val CFG_TRUE_KEY '.truenas.key'
     CFG_TRUE_NAME=$(jq_val '.truenas.name' '')
     CFG_TRUE_PREFIX=$(jq_val '.truenas.prefix' 'truenas_certs_')
     CFG_TRUE_KEEP=$(jq_val '.truenas.keep' '2')
@@ -245,6 +264,7 @@ platform_cmd_truenas() {
         "$WORKSPACE_DIR/deploy_to_truenas.sh"
         -H "$CFG_TRUE_HOST"
         -A "$CFG_TRUE_API_KEY"
+        -u "$CFG_TRUE_USERNAME"
         -c "$CFG_TRUE_CERT"
         -k "$CFG_TRUE_KEY"
         --ws-path "$CFG_TRUE_WS_PATH"
@@ -254,6 +274,9 @@ platform_cmd_truenas() {
     if [ -n "$CFG_TRUE_NAME" ]; then
         _c+=( -n "$CFG_TRUE_NAME" )
     fi
+    if [ "$CFG_TRUE_SCRAM" = "true" ]; then
+        _c+=( --scram )
+    fi
 }
 
 # ==========================================================
@@ -261,9 +284,12 @@ platform_cmd_truenas() {
 # ==========================================================
 check_dependencies() {
     local deps=(curl jq openssl) missing=()
-    # sshpass/ssh/scp 仅 OPNsense 平台需要
+    # ssh/scp 仅 OPNsense 平台需要; sshpass 仅在其使用 SSH 密码认证时需要
     if platform_enabled opnsense; then
-        deps+=(sshpass ssh scp)
+        deps+=(ssh scp)
+        if [ -z "$(jq_val '.opnsense.ssh_key' '')" ]; then
+            deps+=(sshpass)
+        fi
     fi
     local cmd
     for cmd in "${deps[@]}"; do
@@ -326,14 +352,20 @@ verify_deployed_cert() {
         return 0
     fi
     local expected actual attempt
+    # host 字段可能已包含端口 (如 TrueNAS 的 host:port), 统一剥离后以 verify_port 为准
+    local connect_host="$host"
+    if [[ "$host" != \[* ]]; then
+        connect_host="${host%%:*}"
+    fi
     expected=$(cert_fingerprint "$cert")
     if [ -z "$expected" ]; then
         log_warning "[$label] 无法计算本地证书指纹，跳过部署后验证"
         return 0
     fi
-    log_info "[$label] 验证 ${host}:${port} 实际生效的证书..."
+    log_info "[$label] 验证 ${connect_host}:${port} 实际生效的证书..."
     for (( attempt = 1; attempt <= VERIFY_RETRIES; attempt++ )); do
-        actual=$(echo | openssl s_client -connect "${host}:${port}" -servername "$host" 2>/dev/null \
+        # timeout 防止服务不可达时 s_client 长时间阻塞
+        actual=$(echo | timeout 15 openssl s_client -connect "${connect_host}:${port}" -servername "$connect_host" 2>/dev/null \
             | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
         if [ -n "$actual" ] && [ "$actual" = "$expected" ]; then
             log_success "[$label] 验证通过: 远端证书指纹与本地一致"
@@ -405,8 +437,8 @@ rotate_log_if_needed
 if [ "${1:-}" == "remove-cron" ]; then
     DEPLOY_SCRIPT="$WORKSPACE_DIR/deploy_all.sh"
     log_info "===== 移除部署定时任务 ====="
-    if crontab -l 2>/dev/null | grep -q "$DEPLOY_SCRIPT"; then
-        crontab -l | grep -v "$DEPLOY_SCRIPT" | crontab -
+    if crontab -l 2>/dev/null | grep -Fq "$DEPLOY_SCRIPT"; then
+        crontab -l | grep -Fv "$DEPLOY_SCRIPT" | crontab -
         log_success "成功从 crontab 中移除了部署任务"
     else
         log_info "crontab 中未发现本脚本的定时任务"
@@ -443,9 +475,9 @@ if [ "${1:-}" == "setup-cron" ]; then
         DEPLOY_SCRIPT="$WORKSPACE_DIR/deploy_all.sh"
         NEW_CRON="$min $hour $dom $mon $dow $DEPLOY_SCRIPT"
 
-        if crontab -l 2>/dev/null | grep -q "$DEPLOY_SCRIPT"; then
+        if crontab -l 2>/dev/null | grep -Fq "$DEPLOY_SCRIPT"; then
             log_info "部署脚本已存在于 crontab 中，无需重复添加"
-            log_info "当前任务为: $(crontab -l 2>/dev/null | grep "$DEPLOY_SCRIPT")"
+            log_info "当前任务为: $(crontab -l 2>/dev/null | grep -F "$DEPLOY_SCRIPT")"
         else
             (crontab -l 2>/dev/null; echo "$NEW_CRON") | crontab -
             log_success "自动部署定时任务设定成功"
@@ -470,6 +502,15 @@ log_info "自动化部署流水线启动"
 log_info "阶段 0: 加载集中配置"
 load_config
 log_success "已加载配置文件: $CONFIG_FILE (启用平台: ${ENABLED_PLATFORMS[*]})"
+
+# 预校验启用平台的必填字段：在开始部署前尽早发现配置错误，避免部署中途中断
+for name in "${ENABLED_PLATFORMS[@]}"; do
+    if ! ( "platform_init_$name" ); then
+        log_error "平台 [${PLATFORM_LABELS[$name]}] 必填字段校验未通过，请检查: $CONFIG_FILE"
+        exit "$EXIT_RUNTIME_ERROR"
+    fi
+done
+log_success "平台配置字段校验通过 (${ENABLED_PLATFORMS[*]})"
 
 log_info "阶段 1: 检查系统依赖"
 check_dependencies

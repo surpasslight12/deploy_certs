@@ -6,8 +6,14 @@
 # 更新 UI 绑定并清理旧证书。
 # TrueNAS 25.04 弃用 REST API v2.0，26+ 完全移除。
 #
+# 认证方式:
+#   TrueNAS 25.10+ : auth.login_ex + API_KEY_PLAIN（必须指定密钥所属用户名）
+#   --scram        : SCRAM-SHA-512 认证（官方推荐；适配 LEVEL_2/3 安全级别，需 OpenSSL 3.0+）
+#   旧版本         : 自动回退已弃用的 auth.login_with_api_key
+#   用户名通过 -u/--username 指定，默认 root（也可用 TRUENAS_USERNAME 环境变量）
+#
 # 用法:
-#   deploy_to_truenas.sh -H <host> -A <api_key> -c <cert> -k <key> [options]
+#   deploy_to_truenas.sh -H <host> -A <api_key> [-u <username>] -c <cert> -k <key> [options]
 # ==========================================================
 
 set -euo pipefail
@@ -25,6 +31,8 @@ DEFAULT_KEY=""
 DEFAULT_PREFIX="truenas_certs_"
 DEFAULT_KEEP=2
 DEFAULT_WS_PATH="/api/current"
+# API 密钥所属用户名 (auth.login_ex 认证必需)
+DEFAULT_USERNAME="root"
 JOB_TIMEOUT=120
 POLL_INTERVAL=1
 AUTH_RETRIES=3
@@ -40,11 +48,23 @@ WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBSOCAT_BIN=""
 REQUEST_ID=0
 
+# ws_call_result 的输出与错误状态 (供认证逻辑判断错误类型)
+WS_LAST_RESULT=""
+WS_LAST_ERR_MSG=""
+WS_LAST_ERR_CODE=""
+AUTH_MECHANISM=""
+
+# SCRAM 选项: --scram 启用 SCRAM-SHA-512; SCRAM_UNSUPPORTED 记录服务器不支持以避免重复尝试
+USE_SCRAM=0
+SCRAM_UNSUPPORTED=0
+
 # ==========================================================
 # 工具函数
 # ==========================================================
 print_usage() {
-    print_info "用法: $0 -H <host> -A <api_key> -c <cert> -k <key> [options]"
+    print_info "用法: $0 -H <host> -A <api_key> [-u <username>] -c <cert> -k <key> [options]"
+    print_info "  -u, --username <user>  API 密钥所属用户名 (默认 root; TrueNAS 25.10+ 必须正确)"
+    print_info "  其他选项: --scram, -n <名称>, --ws-path <路径>, --prefix <前缀>, --keep <数量>"
 }
 
 # ==========================================================
@@ -153,7 +173,9 @@ ws_connect() {
     coproc WS_PROC { "$WEBSOCAT_BIN" -t -k --no-close "$url" 2>/dev/null; }
     sleep 0.5
 
-    if ! kill -0 "${WS_PROC_PID}" 2>/dev/null; then
+    # 注意: 若 websocat 已退出 (如连接被拒), bash 5.x 会清除对应变量,
+    # 此处必须用 :- 兜底, 否则在 set -u 下会报 "unbound variable" 并中止脚本
+    if [ -z "${WS_PROC_PID:-}" ] || ! kill -0 "${WS_PROC_PID}" 2>/dev/null; then
         print_error "websocat 连接 $url 失败"
         return 1
     fi
@@ -168,10 +190,29 @@ ws_close() {
     fi
 }
 
-# 发送 JSON-RPC 请求并读取匹配的响应
-ws_call() {
+# 发送 JSON-RPC 请求并将结果写入全局变量 WS_LAST_RESULT。
+# 失败时错误信息写入 WS_LAST_ERR_MSG / WS_LAST_ERR_CODE，供调用方
+# 判断错误类型（如服务器不存在该方法）。
+# 参数: <method> [params_json] [quiet]  quiet=1 时失败不打印错误
+# 返回: 0=成功, 1=失败
+ws_call_result() {
     local method="$1"
     local params="${2:-[]}"
+    local quiet="${3:-0}"
+
+    WS_LAST_RESULT=""
+    WS_LAST_ERR_MSG=""
+    WS_LAST_ERR_CODE=""
+
+    # 连接可能已断开 (coproc 进程退出后 bash 会清除 WS_PROC/WS_PROC_PID),
+    # 提前失败返回, 让调用方走重连/重试逻辑
+    if [ -z "${WS_PROC_PID:-}" ]; then
+        WS_LAST_ERR_MSG="WebSocket 连接已断开"
+        if [ "$quiet" != "1" ]; then
+            print_error "$WS_LAST_ERR_MSG"
+        fi
+        return 1
+    fi
 
     REQUEST_ID=$((REQUEST_ID + 1))
     local payload
@@ -191,34 +232,331 @@ ws_call() {
             has_error=$(echo "$line" | jq 'has("error")' 2>/dev/null) || has_error="false"
 
             if [ "$has_error" = "true" ]; then
-                local reason
-                reason=$(echo "$line" | jq -r '
+                WS_LAST_ERR_MSG=$(echo "$line" | jq -r '
                     .error |
                     if type == "object" then
                         (.data.reason // .message // tostring)
                     else
                         tostring
                     end' 2>/dev/null)
-                print_error "$method 调用失败: $reason"
+                WS_LAST_ERR_CODE=$(echo "$line" | jq -r '.error.code // empty' 2>/dev/null)
+                if [ "$quiet" != "1" ]; then
+                    print_error "$method 调用失败: $WS_LAST_ERR_MSG"
+                fi
                 return 1
             fi
 
-            echo "$line" | jq -c '.result'
+            WS_LAST_RESULT=$(echo "$line" | jq -c '.result')
             return 0
         fi
     done
 
-    print_error "等待 $method 响应超时"
+    WS_LAST_ERR_MSG="等待 $method 响应超时"
+    if [ "$quiet" != "1" ]; then
+        print_error "$WS_LAST_ERR_MSG"
+    fi
     return 1
+}
+
+# ws_call: 旧调用风格，成功时将结果输出到 stdout（供 $(ws_call ...) 使用）
+ws_call() {
+    ws_call_result "$@" || return $?
+    echo "$WS_LAST_RESULT"
+}
+
+# 判断最近一次 ws_call_result 失败是否因为服务器不存在该方法
+# (新版本移除了旧接口；或旧版本没有新接口。JSON-RPC -32601)
+is_method_missing_error() {
+    case "${WS_LAST_ERR_CODE:-}" in
+        -32601) return 0 ;;
+    esac
+
+    local msg
+    msg=$(printf '%s' "${WS_LAST_ERR_MSG:-}" | tr '[:upper:]' '[:lower:]')
+    case "$msg" in
+        *"does not exist"*|*"not found"*|*"no such method"*|*"unknown method"*) return 0 ;;
+    esac
+    return 1
+}
+
+# 尝试新版认证接口 auth.login_ex + API_KEY_PLAIN (TrueNAS 25.10+)
+#
+# 请求:  params: [{"mechanism":"API_KEY_PLAIN","username":<user>,"api_key":<key>}]
+# 响应:  result: {"response_type":"SUCCESS"|"AUTH_ERR"|"DENIED"|"EXPIRED"|"REDIRECT"|...}
+#
+# 返回: 0=成功; 2=服务器不支持该接口(应回退旧接口); 3=认证被明确拒绝; 1=其他失败
+try_login_ex() {
+    local username="$1"
+    local api_key="$2"
+    local params rtype
+
+    # 用 jq 构建参数，避免特殊字符破坏 JSON
+    params=$(jq -cn --arg u "$username" --arg k "$api_key" \
+        '[{"mechanism": "API_KEY_PLAIN", "username": $u, "api_key": $k}]')
+
+    if ! ws_call_result "auth.login_ex" "$params" 1; then
+        if is_method_missing_error; then
+            return 2
+        fi
+        print_error "auth.login_ex 调用失败: ${WS_LAST_ERR_MSG:-响应超时}"
+        return 1
+    fi
+
+    rtype=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.response_type // empty' 2>/dev/null)
+    if [ "$rtype" = "SUCCESS" ]; then
+        return 0
+    fi
+
+    case "$rtype" in
+        AUTH_ERR)     print_error "auth.login_ex 认证被拒: API 密钥无效，或用户名与密钥所属用户不一致" ;;
+        DENIED)       print_error "auth.login_ex 认证被拒: 用户 '$username' 没有 API 访问权限" ;;
+        EXPIRED)      print_error "auth.login_ex 认证被拒: API 密钥已过期或已被吊销" ;;
+        REDIRECT)     print_error "auth.login_ex 认证被拒: 当前节点为 HA 备机，请在主控节点执行部署" ;;
+        OTP_REQUIRED) print_error "auth.login_ex 意外要求二次验证 (OTP_REQUIRED)" ;;
+        *)            print_error "auth.login_ex 认证失败: response_type=${rtype:-<empty>}" ;;
+    esac
+    return 3
+}
+
+# 回退旧版认证接口 auth.login_with_api_key
+# (<25.10 仅支持它; 25.10+ 已弃用; 后续版本已移除)
+#
+# 请求:  params: [<api_key>]
+# 响应:  result: true | false
+#
+# 返回: 0=成功; 2=服务器已移除该接口; 3=认证被拒(false); 1=其他失败
+try_login_legacy() {
+    local api_key="$1"
+    local params result
+
+    params=$(jq -cn --arg k "$api_key" '[$k]')
+
+    if ! ws_call_result "auth.login_with_api_key" "$params" 1; then
+        if is_method_missing_error; then
+            return 2
+        fi
+        print_error "auth.login_with_api_key 调用失败: ${WS_LAST_ERR_MSG:-响应超时}"
+        return 1
+    fi
+
+    result="$WS_LAST_RESULT"
+    if [ "$result" = "true" ]; then
+        return 0
+    fi
+
+    print_error "auth.login_with_api_key 认证被拒: API 密钥无效或已被吊销"
+    return 3
+}
+
+# ==========================================================
+# 特定功能函数: SCRAM-SHA-512 认证 (--scram)
+# 协议参考: TrueNAS 官方文档 docs/source/accounts/scram_authentication.rst
+# 使用原始 API 密钥现场计算 (PBKDF2 一次原生调用), 无需预计算 SCRAM 数据
+# ==========================================================
+
+# OpenSSL 是否支持 kdf 子命令 (PBKDF2; 需要 OpenSSL 3.0+)
+openssl_supports_kdf() {
+    openssl kdf -keylen 16 -kdfopt digest:SHA256 -kdfopt hexpass:78 -kdfopt hexsalt:79 \
+        -kdfopt iter:1 PBKDF2 >/dev/null 2>&1
+}
+
+# 将 hex 字符串转换为 printf %b 转义序列 (二进制经管道处理，不进入变量)
+hex_escape() {
+    local hex="$1" esc="" i
+    for (( i = 0; i < ${#hex}; i += 2 )); do
+        esc+="\\x${hex:i:2}"
+    done
+    printf '%s' "$esc"
+}
+
+# SHA512(hex 表示的二进制数据) -> 小写 hex
+sha512_hex_of_hex() {
+    local esc
+    esc=$(hex_escape "$1")
+    printf '%b' "$esc" | openssl dgst -sha512 -binary | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f'
+}
+
+# HMAC-SHA512(key_hex, 字符串) -> 小写 hex
+hmac_sha512_hex() {
+    local key_hex="$1" data="$2"
+    printf '%s' "$data" | openssl dgst -sha512 -mac HMAC -macopt "hexkey:${key_hex}" -binary \
+        | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f'
+}
+
+# PBKDF2-HMAC-SHA512(key_hex, salt_hex, iterations) -> 小写 hex
+pbkdf2_sha512_hex() {
+    local key_hex="$1" salt_hex="$2" iter="$3"
+    openssl kdf -keylen 64 -kdfopt digest:SHA512 -kdfopt "hexpass:${key_hex}" \
+        -kdfopt "hexsalt:${salt_hex}" -kdfopt "iter:${iter}" PBKDF2 2>/dev/null \
+        | tr -d ':\n ' | tr 'A-F' 'a-f'
+}
+
+# 两个等长 hex 字符串逐字节异或 -> hex
+hex_xor() {
+    local a="$1" b="$2" out="" i ba bb
+    [ "${#a}" -eq "${#b}" ] || return 1
+    for (( i = 0; i < ${#a}; i += 2 )); do
+        ba=$((16#${a:i:2}))
+        bb=$((16#${b:i:2}))
+        printf -v out '%s%02x' "$out" "$(( ba ^ bb ))"
+    done
+    printf '%s' "$out"
+}
+
+# hex -> base64 (二进制经 printf %b 管道输出)
+hex_to_base64() {
+    local esc
+    esc=$(hex_escape "$1")
+    printf '%b' "$esc" | openssl base64 -A
+}
+
+# base64 -> 小写 hex
+base64_to_hex() {
+    printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f'
+}
+
+# 尝试 SCRAM-SHA-512 认证
+#
+# 返回: 0=成功; 2=服务器不支持 SCRAM; 3=认证被拒; 4=服务器签名校验失败(安全错误); 1=其他失败
+try_login_scram() {
+    local username="$1" api_key="$2"
+    local key_id raw_key client_nonce client_first_bare client_first
+    local params rtype stype rfc
+    local server_nonce salt_b64 iterations parts part
+    local raw_key_hex salt_hex salted_hex client_key_hex stored_key_hex
+    local auth_message client_sig_hex proof_hex proof_b64
+    local server_sig_b64 server_sig_hex server_key_hex expected_sig_hex
+
+    # API 密钥格式: <数字id>-<密钥>
+    key_id="${api_key%%-*}"
+    raw_key="${api_key#*-}"
+    if ! [[ "$key_id" =~ ^[0-9]+$ ]] || [ -z "$raw_key" ] || [ "$raw_key" = "$api_key" ]; then
+        print_error "SCRAM: API 密钥格式异常 (应为 <数字id>-<密钥>)"
+        return 1
+    fi
+
+    # 客户端 nonce (32 字节随机, hex 编码; 必须用 head 限制字节数, od 直接读 /dev/urandom 不会 EOF)
+    client_nonce=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    client_first_bare="n=${username}:${key_id},r=${client_nonce}"
+    client_first="n,,${client_first_bare}"
+
+    # 第 1 步: CLIENT_FIRST_MESSAGE
+    params=$(jq -cn --arg s "$client_first" \
+        '[{"mechanism": "SCRAM", "scram_type": "CLIENT_FIRST_MESSAGE", "rfc_str": $s}]')
+    if ! ws_call_result "auth.login_ex" "$params" 1; then
+        if is_method_missing_error; then
+            return 2
+        fi
+        print_error "SCRAM CLIENT_FIRST 调用失败: ${WS_LAST_ERR_MSG:-响应超时}"
+        return 1
+    fi
+
+    rtype=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.response_type // empty' 2>/dev/null)
+    stype=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.scram_type // empty' 2>/dev/null)
+    rfc=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.rfc_str // empty' 2>/dev/null)
+
+    if [ "$rtype" = "AUTH_ERR" ] || [ "$rtype" = "DENIED" ] || [ "$rtype" = "EXPIRED" ]; then
+        print_error "SCRAM 认证被拒: API 密钥无效、已被吊销或用户无权限"
+        return 3
+    fi
+    if [ "$rtype" != "SCRAM_RESPONSE" ] || [ "$stype" != "SERVER_FIRST_RESPONSE" ] || [ -z "$rfc" ]; then
+        print_error "SCRAM 协议响应异常: response_type=${rtype:-<empty>}, scram_type=${stype:-<empty>}"
+        return 1
+    fi
+
+    # 解析 SERVER_FIRST: r=...,s=...,i=...
+    server_nonce=""; salt_b64=""; iterations=""
+    IFS=',' read -r -a parts <<< "$rfc"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            r=*) server_nonce="${part#r=}" ;;
+            s=*) salt_b64="${part#s=}" ;;
+            i=*) iterations="${part#i=}" ;;
+        esac
+    done
+
+    if [ -z "$server_nonce" ] || [ -z "$salt_b64" ] || [ -z "$iterations" ]; then
+        print_error "SCRAM: SERVER_FIRST 解析失败: $rfc"
+        return 1
+    fi
+    if [[ "$server_nonce" != "$client_nonce"* ]]; then
+        print_error "SCRAM: 服务器 nonce 未以客户端 nonce 开头，协议校验失败"
+        return 1
+    fi
+    if ! [[ "$iterations" =~ ^[0-9]+$ ]] || [ "$iterations" -lt 50000 ] || [ "$iterations" -gt 5000000 ]; then
+        print_error "SCRAM: 迭代次数超出合理范围 ($iterations)"
+        return 1
+    fi
+
+    # 计算密钥材料
+    raw_key_hex=$(printf '%s' "$raw_key" | od -An -tx1 | tr -d ' \n' | tr 'A-F' 'a-f')
+    salt_hex=$(base64_to_hex "$salt_b64")
+    if [ -z "$salt_hex" ]; then
+        print_error "SCRAM: salt 解析失败"
+        return 1
+    fi
+    salted_hex=$(pbkdf2_sha512_hex "$raw_key_hex" "$salt_hex" "$iterations")
+    if [ "${#salted_hex}" -ne 128 ]; then
+        print_error "SCRAM: PBKDF2 计算失败 (请确认 OpenSSL 3.0+)"
+        return 1
+    fi
+    client_key_hex=$(hmac_sha512_hex "$salted_hex" "Client Key")
+    stored_key_hex=$(sha512_hex_of_hex "$client_key_hex")
+    auth_message="${client_first_bare},${rfc},c=biws,r=${server_nonce}"
+    client_sig_hex=$(hmac_sha512_hex "$stored_key_hex" "$auth_message")
+    if ! proof_hex=$(hex_xor "$client_key_hex" "$client_sig_hex"); then
+        print_error "SCRAM: 客户端证明计算失败"
+        return 1
+    fi
+    proof_b64=$(hex_to_base64 "$proof_hex")
+    if [ -z "$proof_b64" ]; then
+        print_error "SCRAM: 客户端证明编码失败"
+        return 1
+    fi
+
+    # 第 2 步: CLIENT_FINAL_MESSAGE
+    params=$(jq -cn --arg s "c=biws,r=${server_nonce},p=${proof_b64}" \
+        '[{"mechanism": "SCRAM", "scram_type": "CLIENT_FINAL_MESSAGE", "rfc_str": $s}]')
+    if ! ws_call_result "auth.login_ex" "$params" 1; then
+        print_error "SCRAM CLIENT_FINAL 调用失败: ${WS_LAST_ERR_MSG:-响应超时}"
+        return 1
+    fi
+
+    rtype=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.response_type // empty' 2>/dev/null)
+    stype=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.scram_type // empty' 2>/dev/null)
+    rfc=$(printf '%s' "$WS_LAST_RESULT" | jq -r '.rfc_str // empty' 2>/dev/null)
+
+    if [ "$rtype" = "AUTH_ERR" ] || [ "$rtype" = "DENIED" ] || [ "$rtype" = "EXPIRED" ]; then
+        print_error "SCRAM 认证被拒: API 密钥无效、已被吊销或用户无权限"
+        return 3
+    fi
+    if [ "$rtype" != "SCRAM_RESPONSE" ] || [ "$stype" != "SERVER_FINAL_RESPONSE" ] || [ -z "$rfc" ]; then
+        print_error "SCRAM 协议响应异常: response_type=${rtype:-<empty>}, scram_type=${stype:-<empty>}"
+        return 1
+    fi
+
+    # 第 3 步: 校验服务器签名 (防中间人)
+    if [ "${rfc#v=}" = "$rfc" ] || [ -z "${rfc#v=}" ]; then
+        print_error "SCRAM: SERVER_FINAL 格式异常: $rfc"
+        return 1
+    fi
+    server_sig_b64="${rfc#v=}"
+    server_sig_hex=$(base64_to_hex "$server_sig_b64")
+    server_key_hex=$(hmac_sha512_hex "$salted_hex" "Server Key")
+    expected_sig_hex=$(hmac_sha512_hex "$server_key_hex" "$auth_message")
+    if [ -z "$server_sig_hex" ] || [ "$server_sig_hex" != "$expected_sig_hex" ]; then
+        print_error "SCRAM: 服务器签名校验失败，可能存在中间人攻击，已中止认证"
+        return 4
+    fi
+
+    return 0
 }
 
 connect_and_authenticate() {
     local url="$1"
     local api_key="$2"
-    local attempt auth_params auth_result
-
-    # 用 jq 构建参数，避免 api_key 中的特殊字符破坏 JSON
-    auth_params=$(jq -cn --arg k "$api_key" '[$k]')
+    local username="$3"
+    local attempt rc rc2 rcS
 
     for ((attempt = 1; attempt <= AUTH_RETRIES; attempt++)); do
         ws_connect "$url" || {
@@ -229,19 +567,69 @@ connect_and_authenticate() {
             continue
         }
 
-        auth_result=$(ws_call "auth.login_with_api_key" "$auth_params" 2>/dev/null) || auth_result=""
-        if [ "$auth_result" = "true" ]; then
+        # 0) 可选: 先尝试 SCRAM-SHA-512 (--scram; 适配高安全级别并防重放)
+        if [ "$USE_SCRAM" -eq 1 ] && [ "$SCRAM_UNSUPPORTED" -eq 0 ]; then
+            rcS=0
+            try_login_scram "$username" "$api_key" || rcS=$?
+            case "$rcS" in
+                0)
+                    AUTH_MECHANISM="auth.login_ex (SCRAM-SHA-512)"
+                    return 0
+                    ;;
+                4)
+                    # 服务器签名校验失败属安全错误: 中止认证, 不重试
+                    return 1
+                    ;;
+                2)
+                    SCRAM_UNSUPPORTED=1
+                    print_warning "服务器不支持 SCRAM，回退到 API 密钥 (PLAIN) 认证"
+                    ;;
+                3)
+                    print_warning "SCRAM 认证被拒，回退到 API 密钥 (PLAIN) 认证"
+                    ;;
+                *)
+                    print_warning "SCRAM 认证未完成，回退到 API 密钥 (PLAIN) 认证"
+                    ;;
+            esac
+        fi
+
+        # 1) 优先新版接口 auth.login_ex (TrueNAS 25.10+)
+        rc=0
+        try_login_ex "$username" "$api_key" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            AUTH_MECHANISM="auth.login_ex (API_KEY_PLAIN)"
             return 0
+        fi
+        if [ "$rc" -eq 2 ]; then
+            print_info "服务器不支持 auth.login_ex (TrueNAS < 25.10)，回退到旧版认证接口..."
+        fi
+
+        # 2) 回退旧版接口 auth.login_with_api_key
+        rc2=0
+        try_login_legacy "$api_key" || rc2=$?
+        if [ "$rc2" -eq 0 ]; then
+            AUTH_MECHANISM="auth.login_with_api_key (旧版接口)"
+            return 0
+        fi
+        if [ "$rc2" -eq 2 ] && [ "$rc" -ne 2 ]; then
+            print_warning "服务器已移除旧版 auth.login_with_api_key 接口"
         fi
 
         ws_close
+
+        # 认证被明确拒绝且无有效回退路径时快速失败，避免无意义重试
+        if { [ "$rc" -eq 3 ] && [ "$rc2" -ne 1 ]; } || { [ "$rc2" -eq 3 ] && [ "$rc" -ne 1 ]; }; then
+            break
+        fi
+
         if [ "$attempt" -lt "$AUTH_RETRIES" ]; then
-            print_warning "TrueNAS API 密钥认证失败或超时，${RETRY_DELAY} 秒后重试 (${attempt}/${AUTH_RETRIES})"
+            print_warning "TrueNAS API 密钥认证失败，${RETRY_DELAY} 秒后重试 (${attempt}/${AUTH_RETRIES})"
             sleep "$RETRY_DELAY"
         fi
     done
 
     print_error "TrueNAS API 密钥认证失败"
+    print_error "提示: TrueNAS 25.10+ 请确保 --username/truenas.username 为 API 密钥所属用户，且密钥未过期"
     return 1
 }
 
@@ -300,6 +688,7 @@ CERT="$DEFAULT_CERT"
 KEY="$DEFAULT_KEY"
 CERT_NAME=""
 API_KEY=""
+USERNAME=""
 WS_PATH="$DEFAULT_WS_PATH"
 PREFIX="$DEFAULT_PREFIX"
 KEEP="$DEFAULT_KEEP"
@@ -311,6 +700,8 @@ while [[ $# -gt 0 ]]; do
         -k|--key)       KEY="$2"; shift 2 ;;
         -n|--name)      CERT_NAME="$2"; shift 2 ;;
         -A|--api-key)   API_KEY="$2"; shift 2 ;;
+        -u|--username)  USERNAME="$2"; shift 2 ;;
+        --scram)        USE_SCRAM=1; shift ;;
         --ws-path)      WS_PATH="$2"; shift 2 ;;
         --prefix)       PREFIX="$2"; shift 2 ;;
         --keep)         KEEP="$2"; shift 2 ;;
@@ -322,6 +713,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# 用户名取值: CLI > TRUENAS_USERNAME 环境变量 > 默认 root
+if [ -z "$USERNAME" ]; then
+    USERNAME="${TRUENAS_USERNAME:-$DEFAULT_USERNAME}"
+fi
+
 # 如果未指定证书名称则自动生成
 if [ -z "$CERT_NAME" ]; then
     CERT_NAME="${PREFIX}$(date +%Y%m%d)_$(gen_random_suffix 4)"
@@ -330,15 +726,19 @@ fi
 # ==========================================================
 # 输入验证
 # ==========================================================
-print_info "使用配置: HOST=$HOST, CERT=$CERT, KEY=$KEY, NAME=$CERT_NAME, KEEP=$KEEP"
+AUTH_MODE_DISPLAY="PLAIN (API 密钥)"
+if [ "$USE_SCRAM" -eq 1 ]; then
+    AUTH_MODE_DISPLAY="SCRAM-SHA-512 (不支持时回退 PLAIN)"
+fi
+print_info "使用配置: HOST=$HOST, CERT=$CERT, KEY=$KEY, NAME=$CERT_NAME, USER=$USERNAME, AUTH=$AUTH_MODE_DISPLAY, KEEP=$KEEP"
 
 if [ -z "$HOST" ]; then
     print_error "必须提供主机地址 (--host)"
     exit $EXIT_INVALID_INPUT
 fi
 
-if [ "$KEEP" -lt 1 ]; then
-    print_error "keep 至少为 1"
+if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
+    print_error "keep 必须为不小于 1 的整数"
     exit $EXIT_INVALID_INPUT
 fi
 
@@ -357,6 +757,12 @@ if [ -z "$API_KEY" ]; then
     exit $EXIT_INVALID_INPUT
 fi
 
+# --scram 需要 OpenSSL 3.0+ (kdf 子命令 / PBKDF2)
+if [ "$USE_SCRAM" -eq 1 ] && ! openssl_supports_kdf; then
+    print_error "启用 --scram 需要 OpenSSL 3.0+ (kdf 子命令支持)，当前 OpenSSL 不可用或版本过低"
+    exit $EXIT_RUNTIME_ERROR
+fi
+
 # ==========================================================
 # 初始化 websocat
 # ==========================================================
@@ -368,9 +774,10 @@ trap ws_close EXIT
 # 步骤 1: 连接 TrueNAS WebSocket API 并认证
 # ==========================================================
 print_info "连接 TrueNAS WebSocket API..."
-if ! connect_and_authenticate "wss://${HOST}${WS_PATH}" "$API_KEY"; then
+if ! connect_and_authenticate "wss://${HOST}${WS_PATH}" "$API_KEY" "$USERNAME"; then
     exit $EXIT_RUNTIME_ERROR
 fi
+print_info "认证成功: $AUTH_MECHANISM"
 
 # ==========================================================
 # 步骤 2: 获取当前系统配置
@@ -387,7 +794,9 @@ ACTIVE_CERT_ID=$(echo "$CONFIG_RESP" | parse_ui_cert_id)
 # ==========================================================
 print_info "查询已有证书..."
 
-EXISTING_CERTS=$(ws_call "certificate.query" "[[[\"name\", \"=\", \"$CERT_NAME\"]]]") || EXISTING_CERTS="[]"
+# 用 jq 构建查询条件，避免证书名称中的特殊字符破坏 JSON
+NAME_FILTER=$(jq -cn --arg n "$CERT_NAME" '[[["name", "=", $n]]]')
+EXISTING_CERTS=$(ws_call "certificate.query" "$NAME_FILTER") || EXISTING_CERTS="[]"
 
 EXISTING_COUNT=$(echo "$EXISTING_CERTS" | jq 'length')
 if [ "$EXISTING_COUNT" -gt 0 ]; then
@@ -405,11 +814,13 @@ if [ "$EXISTING_COUNT" -gt 0 ]; then
         exit $EXIT_RUNTIME_ERROR
     }
     DEL_JOB_ID=$(echo "$DEL_JOB_ID" | jq -r '. // empty')
-    if [ -n "$DEL_JOB_ID" ] && [ "$DEL_JOB_ID" != "null" ]; then
+    if [[ "$DEL_JOB_ID" =~ ^[0-9]+$ ]]; then
         wait_for_job "$DEL_JOB_ID" > /dev/null || {
             print_error "删除已有证书任务失败"
             exit $EXIT_RUNTIME_ERROR
         }
+    elif [ -n "$DEL_JOB_ID" ] && [ "$DEL_JOB_ID" != "null" ]; then
+        print_warning "删除响应非任务 ID (${DEL_JOB_ID})，跳过等待"
     fi
 fi
 
@@ -430,8 +841,8 @@ CREATE_JOB_ID=$(ws_call "certificate.create" "$IMPORT_PAYLOAD") || {
 }
 
 CREATE_JOB_ID=$(echo "$CREATE_JOB_ID" | jq -r '. // empty')
-if [ -z "$CREATE_JOB_ID" ] || [ "$CREATE_JOB_ID" = "null" ]; then
-    print_error "证书创建响应异常"
+if ! [[ "$CREATE_JOB_ID" =~ ^[0-9]+$ ]]; then
+    print_error "证书创建响应异常: ${CREATE_JOB_ID:-<empty>}"
     exit $EXIT_RUNTIME_ERROR
 fi
 
@@ -491,7 +902,7 @@ while IFS=$'\t' read -r CERT_ID CERT_NM; do
     print_info "清理旧证书: $CERT_NM (ID: $CERT_ID)..."
     DEL_JOB=$(ws_call "certificate.delete" "[$CERT_ID, false]" 2>/dev/null) || continue
     DEL_JOB_ID=$(echo "$DEL_JOB" | jq -r '. // empty')
-    if [ -n "$DEL_JOB_ID" ] && [ "$DEL_JOB_ID" != "null" ]; then
+    if [[ "$DEL_JOB_ID" =~ ^[0-9]+$ ]]; then
         wait_for_job "$DEL_JOB_ID" > /dev/null 2>&1 || true
     fi
 done <<< "$PRUNE_LIST"
@@ -500,7 +911,9 @@ done <<< "$PRUNE_LIST"
 # 步骤 7: 重启 UI
 # ==========================================================
 print_info "重启 UI..."
-ws_call "system.general.ui_restart" "[0]" > /dev/null 2>&1 || true
+if ! ws_call "system.general.ui_restart" "[0]" > /dev/null 2>&1; then
+    print_warning "UI 重启调用失败，新证书可能尚未生效 (部署后验证将确认实际生效情况)"
+fi
 
 print_success "证书已部署到 $HOST"
 exit $EXIT_SUCCESS
