@@ -56,7 +56,7 @@
       "必填：host / api_key / cert / key",
       "username：API 密钥所属用户，默认 root；TrueNAS 25.10+ 使用 auth.login_ex 认证，必须与密钥所属用户一致，否则报 AUTH_ERR。",
       "可选：name（证书名，默认自动生成 truenas_certs_日期_随机，null=自动）、prefix（托管证书名前缀，默认 truenas_certs_）、keep（保留最新数量，默认 2）、ws_path（WebSocket 路径，默认 /api/current）、verify_port（验证端口，默认 443，0=跳过）",
-      "api_key 为创建密钥时生成的完整字符串，形如 1-xxxxxxxx...；脚本会优先使用新登录接口并在旧版本自动回退。",
+      "api_key 为创建密钥时生成的完整字符串，形如 1-xxxxxxxx...；需要 TrueNAS 25.10+。",
       "scram：true 时使用 SCRAM-SHA-512 认证（官方推荐，抗重放；LEVEL_2/LEVEL_3 高安全级别下必须使用；需要 OpenSSL 3.0+，无需预计算数据）。"
     ],
     "host": "192.168.1.20",

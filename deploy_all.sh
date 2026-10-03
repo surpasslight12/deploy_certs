@@ -99,8 +99,6 @@ print_usage() {
 jq_val() { jq -r "$1 // \"$2\"" "$CONFIG_FILE"; }
 
 # jq 辅助函数: 读取必要字段到指定全局变量，缺失时报错退出
-# 注意: 不能用 $(jq_req ...) 形式 —— exit 只会终止命令替换的子 shell，
-#       主脚本会带着空值继续运行，因此改用 printf -v 直接赋值
 # 用法: req_val <变量名> <jq路径>
 req_val() {
     local var="$1" path="$2" val

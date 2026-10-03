@@ -5,25 +5,21 @@
 # 通过 PVE 官方 REST API 上传证书并触发 pveproxy 重载。
 #
 # 用法:
-#   deploy_to_pve.sh -H <host> -n <node> --token-id <id> \
+#   deploy_to_pve.sh -H <host> [-n <node>] --token-id <id> \
 #       --token-secret <secret> -c <cert> -k <key>
 # ==========================================================
 
 set -euo pipefail
 
+WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 引入共享库 (日志、退出码、文件校验等)
 # shellcheck source=common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+source "$WORKSPACE_DIR/common.sh"
 
 # ==========================================================
 # 常量定义
 # ==========================================================
-DEFAULT_HOST=""
-DEFAULT_NODE="pve"
-DEFAULT_TOKEN_ID=""
-DEFAULT_TOKEN_SECRET=""
-DEFAULT_CERT=""
-DEFAULT_KEY=""
 REQUEST_TIMEOUT=30
 
 # ==========================================================
@@ -36,12 +32,12 @@ print_usage() {
 # ==========================================================
 # 参数解析
 # ==========================================================
-HOST="$DEFAULT_HOST"
-NODE="$DEFAULT_NODE"
-TOKEN_ID="$DEFAULT_TOKEN_ID"
-TOKEN_SECRET="$DEFAULT_TOKEN_SECRET"
-CERT="$DEFAULT_CERT"
-KEY="$DEFAULT_KEY"
+HOST=""
+NODE="pve"
+TOKEN_ID=""
+TOKEN_SECRET=""
+CERT=""
+KEY=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -74,15 +70,10 @@ if [ -z "$TOKEN_ID" ] || [ -z "$TOKEN_SECRET" ]; then
     exit $EXIT_INVALID_INPUT
 fi
 
-print_info "验证本地证书文件..."
-validate_readable_file "$CERT" "证书文件" $EXIT_CERT_NOT_FOUND
-validate_readable_file "$KEY" "密钥文件" $EXIT_KEY_NOT_FOUND
-
 # ==========================================================
-# 步骤 1: 读取证书和密钥数据
+# 步骤 1: 校验并读取证书/密钥
 # ==========================================================
-CERT_DATA=$(cat "$CERT") || { print_error "无法读取证书文件: $CERT"; exit $EXIT_RUNTIME_ERROR; }
-KEY_DATA=$(cat "$KEY") || { print_error "无法读取密钥文件: $KEY"; exit $EXIT_RUNTIME_ERROR; }
+load_cert_key "$CERT" "$KEY"
 
 # ==========================================================
 # 步骤 2: 通过 PVE REST API 上传证书

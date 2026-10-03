@@ -4,13 +4,12 @@
 #
 # 通过 WebSocket JSON-RPC 2.0 API（websocat）导入证书、
 # 更新 UI 绑定并清理旧证书。
-# TrueNAS 25.04 弃用 REST API v2.0，26+ 完全移除。
 #
 # 认证方式:
-#   TrueNAS 25.10+ : auth.login_ex + API_KEY_PLAIN（必须指定密钥所属用户名）
-#   --scram        : SCRAM-SHA-512 认证（官方推荐；适配 LEVEL_2/3 安全级别，需 OpenSSL 3.0+）
-#   旧版本         : 自动回退已弃用的 auth.login_with_api_key
-#   用户名通过 -u/--username 指定，默认 root（也可用 TRUENAS_USERNAME 环境变量）
+#   默认     : auth.login_ex + API_KEY_PLAIN（需 -u/--username 指定密钥所属用户，默认 root）
+#   --scram  : SCRAM-SHA-512（官方推荐；适配 LEVEL_2/3 安全级别，需 OpenSSL 3.0+）
+#
+# 需要 TrueNAS 25.10+（更早版本的 auth.login_with_api_key 已废弃）
 #
 # 用法:
 #   deploy_to_truenas.sh -H <host> -A <api_key> [-u <username>] -c <cert> -k <key> [options]
@@ -18,21 +17,15 @@
 
 set -euo pipefail
 
+WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 引入共享库 (日志、退出码、文件校验等)
 # shellcheck source=common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+source "$WORKSPACE_DIR/common.sh"
 
 # ==========================================================
 # 常量定义
 # ==========================================================
-DEFAULT_HOST=""
-DEFAULT_CERT=""
-DEFAULT_KEY=""
-DEFAULT_PREFIX="truenas_certs_"
-DEFAULT_KEEP=2
-DEFAULT_WS_PATH="/api/current"
-# API 密钥所属用户名 (auth.login_ex 认证必需)
-DEFAULT_USERNAME="root"
 JOB_TIMEOUT=120
 POLL_INTERVAL=1
 AUTH_RETRIES=3
@@ -44,7 +37,6 @@ WS_RESPONSE_TIMEOUT=30
 WEBSOCAT_VERSION="1.14.1"
 WEBSOCAT_RELEASE_BASE="https://github.com/vi/websocat/releases/download"
 
-WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBSOCAT_BIN=""
 REQUEST_ID=0
 
@@ -173,8 +165,7 @@ ws_connect() {
     coproc WS_PROC { "$WEBSOCAT_BIN" -t -k --no-close "$url" 2>/dev/null; }
     sleep 0.5
 
-    # 注意: 若 websocat 已退出 (如连接被拒), bash 5.x 会清除对应变量,
-    # 此处必须用 :- 兜底, 否则在 set -u 下会报 "unbound variable" 并中止脚本
+    # websocat 若已退出, bash 会清除 WS_PROC_PID, 故用 :- 兜底
     if [ -z "${WS_PROC_PID:-}" ] || ! kill -0 "${WS_PROC_PID}" 2>/dev/null; then
         print_error "websocat 连接 $url 失败"
         return 1
@@ -204,8 +195,7 @@ ws_call_result() {
     WS_LAST_ERR_MSG=""
     WS_LAST_ERR_CODE=""
 
-    # 连接可能已断开 (coproc 进程退出后 bash 会清除 WS_PROC/WS_PROC_PID),
-    # 提前失败返回, 让调用方走重连/重试逻辑
+    # 连接断开 (coproc 变量被清除) 时提前返回, 由调用方重试
     if [ -z "${WS_PROC_PID:-}" ]; then
         WS_LAST_ERR_MSG="WebSocket 连接已断开"
         if [ "$quiet" != "1" ]; then
@@ -258,14 +248,13 @@ ws_call_result() {
     return 1
 }
 
-# ws_call: 旧调用风格，成功时将结果输出到 stdout（供 $(ws_call ...) 使用）
+# ws_call: 成功时将结果输出到 stdout（供 $(ws_call ...) 使用）
 ws_call() {
     ws_call_result "$@" || return $?
     echo "$WS_LAST_RESULT"
 }
 
-# 判断最近一次 ws_call_result 失败是否因为服务器不存在该方法
-# (新版本移除了旧接口；或旧版本没有新接口。JSON-RPC -32601)
+# 判断最近一次 ws_call_result 失败是否因为服务器不存在该方法 (JSON-RPC -32601)
 is_method_missing_error() {
     case "${WS_LAST_ERR_CODE:-}" in
         -32601) return 0 ;;
@@ -284,7 +273,7 @@ is_method_missing_error() {
 # 请求:  params: [{"mechanism":"API_KEY_PLAIN","username":<user>,"api_key":<key>}]
 # 响应:  result: {"response_type":"SUCCESS"|"AUTH_ERR"|"DENIED"|"EXPIRED"|"REDIRECT"|...}
 #
-# 返回: 0=成功; 2=服务器不支持该接口(应回退旧接口); 3=认证被明确拒绝; 1=其他失败
+# 返回: 0=成功; 2=服务器不支持该接口(版本过低); 3=认证被明确拒绝; 1=其他失败
 try_login_ex() {
     local username="$1"
     local api_key="$2"
@@ -315,36 +304,6 @@ try_login_ex() {
         OTP_REQUIRED) print_error "auth.login_ex 意外要求二次验证 (OTP_REQUIRED)" ;;
         *)            print_error "auth.login_ex 认证失败: response_type=${rtype:-<empty>}" ;;
     esac
-    return 3
-}
-
-# 回退旧版认证接口 auth.login_with_api_key
-# (<25.10 仅支持它; 25.10+ 已弃用; 后续版本已移除)
-#
-# 请求:  params: [<api_key>]
-# 响应:  result: true | false
-#
-# 返回: 0=成功; 2=服务器已移除该接口; 3=认证被拒(false); 1=其他失败
-try_login_legacy() {
-    local api_key="$1"
-    local params result
-
-    params=$(jq -cn --arg k "$api_key" '[$k]')
-
-    if ! ws_call_result "auth.login_with_api_key" "$params" 1; then
-        if is_method_missing_error; then
-            return 2
-        fi
-        print_error "auth.login_with_api_key 调用失败: ${WS_LAST_ERR_MSG:-响应超时}"
-        return 1
-    fi
-
-    result="$WS_LAST_RESULT"
-    if [ "$result" = "true" ]; then
-        return 0
-    fi
-
-    print_error "auth.login_with_api_key 认证被拒: API 密钥无效或已被吊销"
     return 3
 }
 
@@ -556,7 +515,7 @@ connect_and_authenticate() {
     local url="$1"
     local api_key="$2"
     local username="$3"
-    local attempt rc rc2 rcS
+    local attempt rc rcS
 
     for ((attempt = 1; attempt <= AUTH_RETRIES; attempt++)); do
         ws_connect "$url" || {
@@ -593,7 +552,7 @@ connect_and_authenticate() {
             esac
         fi
 
-        # 1) 优先新版接口 auth.login_ex (TrueNAS 25.10+)
+        # 1) auth.login_ex + API_KEY_PLAIN (TrueNAS 25.10+)
         rc=0
         try_login_ex "$username" "$api_key" || rc=$?
         if [ "$rc" -eq 0 ]; then
@@ -601,27 +560,15 @@ connect_and_authenticate() {
             return 0
         fi
         if [ "$rc" -eq 2 ]; then
-            print_info "服务器不支持 auth.login_ex (TrueNAS < 25.10)，回退到旧版认证接口..."
-        fi
-
-        # 2) 回退旧版接口 auth.login_with_api_key
-        rc2=0
-        try_login_legacy "$api_key" || rc2=$?
-        if [ "$rc2" -eq 0 ]; then
-            AUTH_MECHANISM="auth.login_with_api_key (旧版接口)"
-            return 0
-        fi
-        if [ "$rc2" -eq 2 ] && [ "$rc" -ne 2 ]; then
-            print_warning "服务器已移除旧版 auth.login_with_api_key 接口"
+            print_error "服务器不支持 auth.login_ex，需要 TrueNAS 25.10+"
         fi
 
         ws_close
 
-        # 认证被明确拒绝且无有效回退路径时快速失败，避免无意义重试
-        if { [ "$rc" -eq 3 ] && [ "$rc2" -ne 1 ]; } || { [ "$rc2" -eq 3 ] && [ "$rc" -ne 1 ]; }; then
+        # 方法缺失或认证被拒绝: 重试无意义; 其他失败(如超时)继续重试
+        if [ "$rc" -ne 1 ]; then
             break
         fi
-
         if [ "$attempt" -lt "$AUTH_RETRIES" ]; then
             print_warning "TrueNAS API 密钥认证失败，${RETRY_DELAY} 秒后重试 (${attempt}/${AUTH_RETRIES})"
             sleep "$RETRY_DELAY"
@@ -629,7 +576,7 @@ connect_and_authenticate() {
     done
 
     print_error "TrueNAS API 密钥认证失败"
-    print_error "提示: TrueNAS 25.10+ 请确保 --username/truenas.username 为 API 密钥所属用户，且密钥未过期"
+    print_error "提示: 请确保 --username/truenas.username 为 API 密钥所属用户，且密钥未过期"
     return 1
 }
 
@@ -683,15 +630,16 @@ parse_ui_cert_id() {
 # ==========================================================
 # 参数解析
 # ==========================================================
-HOST="$DEFAULT_HOST"
-CERT="$DEFAULT_CERT"
-KEY="$DEFAULT_KEY"
+# 默认值 (前缀 truenas_certs_, 保留 2 份, WS 路径 /api/current)
+HOST=""
+CERT=""
+KEY=""
 CERT_NAME=""
 API_KEY=""
 USERNAME=""
-WS_PATH="$DEFAULT_WS_PATH"
-PREFIX="$DEFAULT_PREFIX"
-KEEP="$DEFAULT_KEEP"
+WS_PATH="/api/current"
+PREFIX="truenas_certs_"
+KEEP=2
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -715,7 +663,7 @@ done
 
 # 用户名取值: CLI > TRUENAS_USERNAME 环境变量 > 默认 root
 if [ -z "$USERNAME" ]; then
-    USERNAME="${TRUENAS_USERNAME:-$DEFAULT_USERNAME}"
+    USERNAME="${TRUENAS_USERNAME:-root}"
 fi
 
 # 如果未指定证书名称则自动生成
@@ -742,12 +690,7 @@ if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
     exit $EXIT_INVALID_INPUT
 fi
 
-print_info "验证本地证书文件..."
-validate_readable_file "$CERT" "证书文件" $EXIT_CERT_NOT_FOUND
-validate_readable_file "$KEY" "密钥文件" $EXIT_KEY_NOT_FOUND
-
-CERT_DATA=$(cat "$CERT") || { print_error "无法读取证书文件"; exit $EXIT_RUNTIME_ERROR; }
-KEY_DATA=$(cat "$KEY") || { print_error "无法读取密钥文件"; exit $EXIT_RUNTIME_ERROR; }
+load_cert_key "$CERT" "$KEY"
 
 if [ -z "$API_KEY" ]; then
     API_KEY="${TRUENAS_API_KEY:-}"

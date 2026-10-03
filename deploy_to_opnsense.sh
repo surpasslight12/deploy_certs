@@ -4,7 +4,7 @@
 #
 # 采用 "官方 Trust API + SSH 绑定" 的混合实现：
 #   - 通过官方 Trust API 导入/查询/删除证书并触发 reconfigure
-#   - 通过 SSH 上传 PHP 脚本更新 WebGUI ssl-certref 绑定并重载
+#   - 通过 SSH 上传 opnsense_bind.php 更新 WebGUI ssl-certref 绑定并重载
 #   - SSH 认证支持密码 (-P，需 sshpass) 或私钥 (-i，推荐)；同时提供时优先密钥
 #
 # 用法:
@@ -14,26 +14,15 @@
 
 set -euo pipefail
 
+WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 引入共享库 (日志、退出码、文件校验等)
 # shellcheck source=common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+source "$WORKSPACE_DIR/common.sh"
 
 # ==========================================================
 # 常量定义
 # ==========================================================
-DEFAULT_HOST=""
-DEFAULT_PORT=22
-DEFAULT_USER=""
-DEFAULT_PASSWORD=""
-DEFAULT_API_KEY=""
-DEFAULT_API_SECRET=""
-DEFAULT_API_PORT=443
-DEFAULT_CERT=""
-DEFAULT_KEY=""
-DEFAULT_REMOTE_DIR="/tmp"
-DEFAULT_PREFIX="opnsense_certs_"
-DEFAULT_KEEP=2
-DEFAULT_SSH_KEY=""
 API_TIMEOUT=20
 SSH_TIMEOUT=15
 
@@ -125,19 +114,20 @@ scp_upload() {
 # ==========================================================
 # 参数解析
 # ==========================================================
-HOST="$DEFAULT_HOST"
-PORT="$DEFAULT_PORT"
-USER="$DEFAULT_USER"
-PASSWORD="$DEFAULT_PASSWORD"
-SSH_KEY="$DEFAULT_SSH_KEY"
-API_KEY="$DEFAULT_API_KEY"
-API_SECRET="$DEFAULT_API_SECRET"
-API_PORT="$DEFAULT_API_PORT"
-CERT="$DEFAULT_CERT"
-KEY="$DEFAULT_KEY"
-REMOTE_DIR="$DEFAULT_REMOTE_DIR"
-PREFIX="$DEFAULT_PREFIX"
-KEEP="$DEFAULT_KEEP"
+# 默认值 (SSH 端口 22, API 端口 443, 前缀 opnsense_certs_, 保留 2 份)
+HOST=""
+PORT=22
+USER=""
+PASSWORD=""
+SSH_KEY=""
+API_KEY=""
+API_SECRET=""
+API_PORT=443
+CERT=""
+KEY=""
+REMOTE_DIR="/tmp"
+PREFIX="opnsense_certs_"
+KEEP=2
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -210,91 +200,14 @@ else
 fi
 print_info "使用配置: HOST=$HOST, USER=$USER, SSH=$SSH_MODE, API=已启用, CERT=$CERT, KEY=$KEY"
 
-print_info "验证本地证书文件..."
-validate_readable_file "$CERT" "证书文件" $EXIT_CERT_NOT_FOUND
-validate_readable_file "$KEY" "密钥文件" $EXIT_KEY_NOT_FOUND
+load_cert_key "$CERT" "$KEY"
 
-CERT_DATA=$(cat "$CERT") || { print_error "无法读取证书文件"; exit $EXIT_RUNTIME_ERROR; }
-KEY_DATA=$(cat "$KEY") || { print_error "无法读取密钥文件"; exit $EXIT_RUNTIME_ERROR; }
-
-# ==========================================================
-# WebGUI ssl-certref 绑定 PHP 脚本
-# ==========================================================
-read -r -d '' PHP_BINDER << 'PHPEOF' || true
-<?php
-if ($argc < 2) { echo "Usage: php bind.php <refid>\n"; exit(2); }
-$refid = $argv[1];
-
-$conf = '/conf/config.xml';
-if (!file_exists($conf) || !is_writable($conf)) {
-    echo "Error: /conf/config.xml not writable or missing\n";
-    exit(5);
-}
-
-libxml_use_internal_errors(true);
-$dom = new DOMDocument('1.0', 'UTF-8');
-$dom->preserveWhiteSpace = false;
-$dom->formatOutput = true;
-
-if ($dom->loadXML(file_get_contents($conf)) === false) {
-    echo "Error: Failed to parse /conf/config.xml\n";
-    exit(4);
-}
-
-$systems = $dom->getElementsByTagName('system');
-if ($systems->length === 0) {
-    echo "Error: Missing <system> node in /conf/config.xml\n";
-    exit(3);
-}
-
-$system = $systems->item(0);
-$webgui = null;
-foreach ($system->childNodes as $child) {
-    if ($child->nodeType === XML_ELEMENT_NODE && $child->nodeName === 'webgui') {
-        $webgui = $child;
-        break;
-    }
-}
-if ($webgui === null) {
-    $webgui = $dom->createElement('webgui');
-    $system->appendChild($webgui);
-}
-
-$sslref = null;
-foreach ($webgui->childNodes as $child) {
-    if ($child->nodeType === XML_ELEMENT_NODE && $child->nodeName === 'ssl-certref') {
-        $sslref = $child;
-        break;
-    }
-}
-if ($sslref === null) {
-    $sslref = $dom->createElement('ssl-certref');
-    $webgui->appendChild($sslref);
-}
-
-while ($sslref->hasChildNodes()) { $sslref->removeChild($sslref->firstChild); }
-$sslref->appendChild($dom->createTextNode($refid));
-
-if ($dom->save($conf) === false) {
-    echo "Error: Failed to write updated config.xml\n";
-    exit(3);
-}
-
-echo "Successfully updated WebGUI ssl-certref in /conf/config.xml\n";
-
-$rout = [];
-@exec('/usr/local/sbin/configctl webgui restart 2>&1', $rout, $rrc);
-if (!empty($rout)) {
-    echo implode("\n", $rout) . "\n";
-}
-if ($rrc !== 0) {
-    echo "ERROR: configctl webgui restart failed (rc={$rrc})\n";
-    exit(6);
-}
-echo "SUCCESS: WebGUI certificate binding updated and reloaded.\n";
-exit(0);
-?>
-PHPEOF
+# WebGUI 绑定脚本 (随脚本目录分发, 上传到远端执行)
+BIND_PHP="$WORKSPACE_DIR/opnsense_bind.php"
+if [ ! -r "$BIND_PHP" ]; then
+    print_error "缺少 PHP 绑定脚本: $BIND_PHP"
+    exit $EXIT_RUNTIME_ERROR
+fi
 
 # ==========================================================
 # 步骤 1: 通过 Trust API 导入证书
@@ -362,19 +275,14 @@ fi
 print_info "通过 SSH 连接 OPNsense ($HOST)，用户: $USER..."
 print_info "将导入的证书绑定到 WebGUI..."
 
-# 上传 PHP 脚本、执行、清理
-TMP_PHP=$(mktemp /tmp/opns_bind_XXXXXXXX.php)
-echo "$PHP_BINDER" > "$TMP_PHP"
-
+# 上传 PHP 绑定脚本、执行、清理
 RID=$(gen_random_suffix 8)
 REMOTE_PHP="${REMOTE_DIR%/}/${RID}_bind.php"
 
-scp_upload "$TMP_PHP" "$REMOTE_PHP" > /dev/null 2>&1 || {
+scp_upload "$BIND_PHP" "$REMOTE_PHP" > /dev/null 2>&1 || {
     print_error "通过 SCP 上传 PHP 绑定脚本失败"
-    rm -f "$TMP_PHP"
     exit $EXIT_RUNTIME_ERROR
 }
-rm -f "$TMP_PHP"
 
 # 执行 PHP 绑定脚本并捕获输出
 BIND_OUTPUT=$(ssh_exec "php '$REMOTE_PHP' '$CERT_REFID'; rm -f '$REMOTE_PHP'") || true

@@ -58,3 +58,17 @@ gen_random_suffix() {
     local len="${1:-4}"
     head -c "$(( (len + 1) / 2 ))" /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c "$len"
 }
+
+# 校验证书/密钥文件并读取内容到全局 CERT_DATA / KEY_DATA
+# 校验失败时以对应退出码终止 (2=证书缺失, 3=密钥缺失, 4=不可读)
+# 用法: load_cert_key <cert_path> <key_path>
+load_cert_key() {
+    local cert="$1" key="$2"
+    print_info "验证本地证书文件..."
+    validate_readable_file "$cert" "证书文件" "$EXIT_CERT_NOT_FOUND"
+    validate_readable_file "$key" "密钥文件" "$EXIT_KEY_NOT_FOUND"
+    # shellcheck disable=SC2034  # 供 source 本库的脚本使用
+    CERT_DATA=$(cat "$cert") || { print_error "无法读取证书文件: $cert"; return "$EXIT_RUNTIME_ERROR"; }
+    # shellcheck disable=SC2034
+    KEY_DATA=$(cat "$key") || { print_error "无法读取密钥文件: $key"; return "$EXIT_RUNTIME_ERROR"; }
+}
